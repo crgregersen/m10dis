@@ -6,10 +6,6 @@
 - **6× Tesla M10 = 24× GM107 (8 GB each, 192 GB total)** hold the routed and shared experts, the n-gram embedding table (PLE) and the LM head, and compute on them.
 - Everything hangs off **one PCIe switch** (PLX PEX8748) on a desktop B250 board with a 4-core i5. RTX ↔ M10 traffic goes peer-to-peer through the switch, never through the CPU. Requests reach the four GPUs of a card through **PCIe multicast** in the M10's own PEX8747.
 
-![The final rig: the RTX 3070 Ti is the card at the far left, the only one without a shroud fan; the six Tesla M10 cards with their fans are to its right](docs/img/rig.jpg)
-
-*The final rig. The RTX 3070 Ti is the card at the far left, the only one without a shroud fan attached; the six Tesla M10 cards, each with its fan, sit to its right.*
-
 ![PCIe topology](docs/img/topology.svg)
 
 ## Results
@@ -43,6 +39,10 @@ This is a **research system for one specific machine**, published so others can 
 - The runners write switch registers and GPU page-table entries. Every one of them is saved, verified and restored, and the runners check this. Read [docs/RUNNING.md](docs/RUNNING.md) before you run anything.
 - The model files, expert bundles and n-gram embedding shards take about 350 GB on fast local disk.
 - Tested with Linux 7.0.14, NVIDIA driver 580.178.04, CUDA 12.4 (sm_50 for the M10s), vLLM 0.32.0, PyTorch 2.13 + cu132, Python 3.14.
+
+![The final rig: the RTX 3070 Ti is the card at the far left, the only one without a shroud fan; the six Tesla M10 cards with their fans are to its right](docs/img/rig.jpg)
+
+*The final rig. The RTX 3070 Ti is the card at the far left, the only one without a shroud fan attached; the six Tesla M10 cards, each with its fan, sit to its right.*
 
 ## Repository layout
 
