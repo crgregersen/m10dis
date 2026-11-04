@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+
+# fancontrol command sensor: print the hottest installed Tesla M10 GPU in
+# millidegrees Celsius. The number of cards is discovered dynamically. A valid
+# installation has four GPU functions per M10; partial enumeration fails safe.
+
+set -u
+
+readonly FAILSAFE_MILLIC=255000
+readonly NVIDIA_SMI=/usr/bin/nvidia-smi
+readonly TIMEOUT=/usr/bin/timeout
+readonly FORCE_FAILSAFE=/run/m10-fan-force-failsafe
+readonly PCI_SYSFS=/sys/bus/pci/devices
+readonly CACHE_FILE=/run/m10-max-temp.cache
+readonly CACHE_LOCK=/run/m10-max-temp.lock
+readonly CACHE_TTL_SECONDS=4
+
+# fancontrol invokes its temperature helper once for every PWM output. All
+# six outputs use the same hottest-M10 temperature, so serialize the first
+# query and reuse that one sample for the rest of the control cycle. Without
+# this cache, independent nvidia-smi calls can time out on only one output
+# and make that one fan bank jump to MAXPWM while its peers remain quiet.
+if ! command -v flock >/dev/null 2>&1 || ! exec 9>"$CACHE_LOCK" 2>/dev/null; then
+	/usr/bin/logger -p daemon.warning -t m10-max-temp -- "FAILSAFE reason=lock_open_or_flock_missing" || true
+	printf '%d\n' "$FAILSAFE_MILLIC"
+	exit 0
+fi
+if ! flock -x 9; then
+	/usr/bin/logger -p daemon.warning -t m10-max-temp -- "FAILSAFE reason=lock_acquire_failed" || true
+	printf '%d\n' "$FAILSAFE_MILLIC"
+	exit 0
+fi
+
+readonly LAST_GOOD_FILE=/run/m10-max-temp.last-good
+readonly FAIL_COUNT_FILE=/run/m10-max-temp.failure-count
+readonly LAST_GOOD_MAX_AGE_SECONDS=10
+readonly FAILSAFE_AFTER_FAILURES=2
+
+cache_and_exit() {
+	local value=$1 now tmp
+	now=$(date +%s)
+	tmp="${CACHE_FILE}.$$"
+	if printf '%s %s\n' "$now" "$value" >"$tmp"; then
+		mv -f -- "$tmp" "$CACHE_FILE" || true
+	fi
+	printf '%s\n' "$value"
+	exit 0
+}
+
+good_and_exit() {
+	local value=$1 now tmp
+	now=$(date +%s)
+	tmp="${LAST_GOOD_FILE}.$$"
+	if printf '%s %s\n' "$now" "$value" >"$tmp"; then
+		mv -f -- "$tmp" "$LAST_GOOD_FILE" || true
+	fi
+	tmp="${FAIL_COUNT_FILE}.$$"
+	if printf '0\n' >"$tmp"; then
+		mv -f -- "$tmp" "$FAIL_COUNT_FILE" || true
+	fi
+	cache_and_exit "$value"
+}
+
+force_fail_safe() {
+	/usr/bin/logger -p daemon.warning -t m10-max-temp -- "FAILSAFE reason=operator_force_flag" || true
+	cache_and_exit "$FAILSAFE_MILLIC"
+}
+
+fail_safe() {
+	local call_line=${BASH_LINENO[0]:-unknown}
+	local failure_count=0 now last_time last_value age tmp
+	if [[ -r $FAIL_COUNT_FILE ]]; then
+		read -r failure_count <"$FAIL_COUNT_FILE" || failure_count=0
+	fi
+	[[ $failure_count =~ ^[0-9]+$ ]] || failure_count=0
+	failure_count=$((failure_count + 1))
+	tmp="${FAIL_COUNT_FILE}.$$"
+	if printf '%s\n' "$failure_count" >"$tmp"; then
+		mv -f -- "$tmp" "$FAIL_COUNT_FILE" || true
+	fi
+
+	now=$(date +%s)
+	if (( failure_count < FAILSAFE_AFTER_FAILURES )) && [[ -r $LAST_GOOD_FILE ]]; then
+		read -r last_time last_value <"$LAST_GOOD_FILE" || true
+		if [[ ${last_time:-} =~ ^[0-9]+$ && ${last_value:-} =~ ^[0-9]+$ ]] &&
+		   (( now >= last_time && now - last_time <= LAST_GOOD_MAX_AGE_SECONDS &&
+		      last_value < FAILSAFE_MILLIC )); then
+			/usr/bin/logger -p daemon.warning -t m10-max-temp -- \
+				"TRANSIENT_ERROR count=$failure_count using_last_good=${last_value} source_line=$call_line" || true
+			cache_and_exit "$last_value"
+		fi
+	fi
+
+	if (( failure_count == FAILSAFE_AFTER_FAILURES || failure_count % 12 == 0 )); then
+		/usr/bin/logger -p daemon.warning -t m10-max-temp -- \
+			"FAILSAFE count=$failure_count reason=consecutive_sensor_or_enumeration_error source_line=$call_line" || true
+	fi
+	cache_and_exit "$FAILSAFE_MILLIC"
+}
+
+read_m10_max_temp() {
+	local pci_count=0 pci_device vendor device output bus name temperature extra
+	local count max_temp row previous_bus
+	local -a rows=()
+	local -A seen=()
+
+	for pci_device in "$PCI_SYSFS"/*; do
+		[[ -r $pci_device/vendor && -r $pci_device/device ]] || continue
+		read -r vendor <"$pci_device/vendor" || return 1
+		read -r device <"$pci_device/device" || return 1
+		if [[ ${vendor,,} == 0x10de && ${device,,} == 0x13bd ]]; then
+			(( ++pci_count ))
+		fi
+	done
+	(( pci_count > 0 && pci_count % 4 == 0 )) || return 1
+
+	output=$(
+		"$TIMEOUT" --signal=KILL 1.5s "$NVIDIA_SMI" \
+			--query-gpu=pci.bus_id,name,temperature.gpu \
+			--format=csv,noheader,nounits 2>/dev/null
+	) || return 1
+
+	while IFS=, read -r bus name temperature extra; do
+		bus=${bus#"${bus%%[![:space:]]*}"}
+		bus=${bus%"${bus##*[![:space:]]}"}
+		name=${name#"${name%%[![:space:]]*}"}
+		name=${name%"${name##*[![:space:]]}"}
+		temperature=${temperature#"${temperature%%[![:space:]]*}"}
+		temperature=${temperature%"${temperature##*[![:space:]]}"}
+
+		[[ $bus =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || return 1
+		[[ -z $extra ]] || return 1
+		[[ $name == 'Tesla M10' ]] || continue
+		[[ $temperature =~ ^[0-9]+$ ]] || return 1
+		(( temperature >= 0 && temperature <= 110 )) || return 1
+		rows+=("${bus^^} $temperature")
+	done <<<"$output"
+
+	count=${#rows[@]}
+	(( count > 0 && count % 4 == 0 && count == pci_count )) || return 1
+	max_temp=-1
+	previous_bus=
+	for row in "${rows[@]}"; do
+		bus=${row%% *}
+		temperature=${row##* }
+		[[ $bus != "$previous_bus" && -z ${seen[$bus]:-} ]] || return 1
+		[[ $temperature =~ ^[0-9]+$ ]] || return 1
+		seen[$bus]=1
+		(( temperature > max_temp )) && max_temp=$temperature
+		previous_bus=$bus
+	done
+	(( max_temp >= 0 )) || return 1
+	printf '%s\n' "$max_temp"
+}
+
+now=$(date +%s)
+if [[ -r $CACHE_FILE ]]; then
+	read -r cached_time cached_value <"$CACHE_FILE" || true
+	if [[ ${cached_time:-} =~ ^[0-9]+$ && ${cached_value:-} =~ ^[0-9]+$ ]] &&
+	   (( now >= cached_time && now - cached_time <= CACHE_TTL_SECONDS )); then
+		printf '%s\n' "$cached_value"
+		exit 0
+	fi
+fi
+
+[[ ! -e $FORCE_FAILSAFE ]] || force_fail_safe
+if ! max_temp=$(read_m10_max_temp); then
+	fail_safe
+fi
+good_and_exit "$(( max_temp * 1000 ))"

@@ -1,0 +1,894 @@
+--- a/nvidia-uvm/uvm_tools.c
++++ b/nvidia-uvm/uvm_tools.c
+@@ -3311,6 +3311,7 @@
+ #define UVM_GLM53_MAXWELL_PTE_ADDRESS_VID_PEER_MASK 0x00000000e0000000ULL
+ #define UVM_GLM53_MAXWELL_PTE_VALID_MASK 0x0000000000000001ULL
+ #define UVM_GLM53_MAXWELL_PTE_APERTURE_MASK 0x0000000600000000ULL
++#define UVM_GLM53_MAXWELL_PTE_VOL_MASK 0x0000000100000000ULL
+ #define UVM_GLM53_MAXWELL_PTE_ENTRY_SIZE 8ULL
+ 
+ typedef struct
+@@ -3361,6 +3362,17 @@
+            (source_pte & UVM_GLM53_MAXWELL_PTE_ADDRESS_VID_MASK);
+ }
+ 
++static NV_STATUS glm53_validate_local_pte_volatile_change(NvU64 current_pte, NvU64 requested_pte)
++{
++    if (!glm53_pte_is_local_vidmem(current_pte) || !glm53_pte_is_local_vidmem(requested_pte))
++        return NV_ERR_NOT_SUPPORTED;
++
++    if ((current_pte ^ requested_pte) != UVM_GLM53_MAXWELL_PTE_VOL_MASK)
++        return NV_ERR_NOT_SUPPORTED;
++
++    return NV_OK;
++}
++
+ static NV_STATUS glm53_read_phys_vidmem_u64(uvm_gpu_t *gpu, NvU64 phys_offset, NvU64 *out_value)
+ {
+     uvm_mem_t *stage_mem = NULL;
+@@ -3570,6 +3582,7 @@
+     }
+ 
+     if (params->op != UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY &&
++        params->op != UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY_VOLATILE &&
+         params->op != UVM_GLM53_LOCAL_PTE_REMAP_OP_RESTORE) {
+         status = NV_ERR_INVALID_ARGUMENT;
+         goto done;
+@@ -3580,7 +3593,8 @@
+         goto done;
+     }
+ 
+-    if (params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY) {
++    if (params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY ||
++        params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY_VOLATILE) {
+         if (g_glm53_local_pte_remap_state.active) {
+             status = NV_ERR_STATE_IN_USE;
+             goto done;
+@@ -3619,12 +3633,22 @@
+         goto unlock_va_space;
+     }
+ 
+-    if (params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY) {
+-        status = glm53_validate_local_pte_pair(current_pte, params->replacement_source_pte);
+-        if (status != NV_OK)
+-            goto unlock_va_space;
++    if (params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY ||
++        params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY_VOLATILE) {
++        if (params->op == UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY) {
++            status = glm53_validate_local_pte_pair(current_pte, params->replacement_source_pte);
++            if (status != NV_OK)
++                goto unlock_va_space;
++
++            new_pte = glm53_make_remapped_pte(current_pte, params->replacement_source_pte);
++        }
++        else {
++            status = glm53_validate_local_pte_volatile_change(current_pte, params->replacement_source_pte);
++            if (status != NV_OK)
++                goto unlock_va_space;
+ 
+-        new_pte = glm53_make_remapped_pte(current_pte, params->replacement_source_pte);
++            new_pte = params->replacement_source_pte;
++        }
+ 
+         memset(&g_glm53_local_pte_remap_state, 0, sizeof(g_glm53_local_pte_remap_state));
+         g_glm53_local_pte_remap_state.active = true;
+@@ -5558,6 +5582,7 @@
+ typedef struct
+ {
+     bool owner_active;
++    bool external_owner;
+     bool dma_active;
+     bool remap_active;
+     NvU64 mapping_id;
+@@ -5575,6 +5600,8 @@
+     NvU64 seed;
+     NvU64 mapped_resource_start;
+     NvU64 mapped_resource_end;
++    NvU64 external_owner_bus_start;
++    NvU64 external_owner_bar_offset;
+     NvU64 requester_dma_address;
+     NvU64 requester_dma_length;
+     NvU64 destination_gpu_sys_address;
+@@ -5585,11 +5612,69 @@
+     NvU64 temporary_pte;
+ } glm53_serial_bar1_peer_read_state_t;
+ 
++#define UVM_GLM53_SERIAL_BAR1_MAX_ACTIVE_ROUTES 64U
+ static DEFINE_MUTEX(g_glm53_serial_bar1_peer_read_mutex);
+-static glm53_serial_bar1_peer_read_state_t g_glm53_serial_bar1_peer_read_state;
++static glm53_serial_bar1_peer_read_state_t
++    g_glm53_serial_bar1_peer_read_states[UVM_GLM53_SERIAL_BAR1_MAX_ACTIVE_ROUTES];
++static glm53_serial_bar1_peer_read_state_t *g_glm53_serial_bar1_peer_read_current;
++#define g_glm53_serial_bar1_peer_read_state (*g_glm53_serial_bar1_peer_read_current)
+ static NvU64 g_glm53_serial_bar1_peer_read_next_mapping_id = 1;
+ static NvU64 g_glm53_serial_bar1_peer_read_next_route_id = 1;
+ 
++static bool glm53_serial_bar1_uuid_is_zero(const NvProcessorUuid *uuid)
++{
++    NvU32 i;
++    for (i = 0; i < sizeof(*uuid); ++i) {
++        if (((const NvU8 *)uuid)[i] != 0)
++            return false;
++    }
++    return true;
++}
++
++static glm53_serial_bar1_peer_read_state_t *glm53_serial_bar1_find_mapping_state(NvU64 mapping_id)
++{
++    NvU32 i;
++    if (mapping_id == 0)
++        return NULL;
++    for (i = 0; i < UVM_GLM53_SERIAL_BAR1_MAX_ACTIVE_ROUTES; ++i) {
++        glm53_serial_bar1_peer_read_state_t *state = &g_glm53_serial_bar1_peer_read_states[i];
++        if (state->owner_active && state->mapping_id == mapping_id)
++            return state;
++    }
++    return NULL;
++}
++
++static glm53_serial_bar1_peer_read_state_t *glm53_serial_bar1_find_uuid_state(
++    const NvProcessorUuid *requester_uuid,
++    const NvProcessorUuid *owner_uuid)
++{
++    glm53_serial_bar1_peer_read_state_t *match = NULL;
++    bool owner_is_wildcard = glm53_serial_bar1_uuid_is_zero(owner_uuid);
++    NvU32 i;
++    for (i = 0; i < UVM_GLM53_SERIAL_BAR1_MAX_ACTIVE_ROUTES; ++i) {
++        glm53_serial_bar1_peer_read_state_t *state = &g_glm53_serial_bar1_peer_read_states[i];
++        if (!state->owner_active ||
++            memcmp(&state->requester_uuid, requester_uuid, sizeof(*requester_uuid)) != 0 ||
++            (!owner_is_wildcard &&
++             memcmp(&state->owner_uuid, owner_uuid, sizeof(*owner_uuid)) != 0))
++            continue;
++        if (match)
++            return NULL;
++        match = state;
++    }
++    return match;
++}
++
++static glm53_serial_bar1_peer_read_state_t *glm53_serial_bar1_find_free_state(void)
++{
++    NvU32 i;
++    for (i = 0; i < UVM_GLM53_SERIAL_BAR1_MAX_ACTIVE_ROUTES; ++i) {
++        if (!g_glm53_serial_bar1_peer_read_states[i].owner_active)
++            return &g_glm53_serial_bar1_peer_read_states[i];
++    }
++    return NULL;
++}
++
+ static void glm53_serial_bar1_fill_gpu_outputs(uvm_gpu_t *gpu,
+                                                UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params)
+ {
+@@ -5745,20 +5830,9 @@
+     return NV_OK;
+ }
+ 
+-static void glm53_serial_bar1_decode_pte_outputs(UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params, NvU64 pte)
+-{
+-    params->decoded_aperture_bits = (NvU32)((pte & UVM_GLM53_MAXWELL_PTE_APERTURE_MASK) >> 33);
+-    params->decoded_kind = (NvU32)((pte & UVM_GLM53_MAXWELL_PTE_KIND_MASK) >> 36);
+-    params->decoded_read_only = (pte & UVM_GLM53_MAXWELL_PTE_READ_ONLY_MASK) ? 1 : 0;
+-    params->decoded_read_disable = (pte & UVM_GLM53_MAXWELL_PTE_READ_DISABLE_MASK) ? 1 : 0;
+-    params->decoded_write_disable = (pte & UVM_GLM53_MAXWELL_PTE_WRITE_DISABLE_MASK) ? 1 : 0;
+-    params->decoded_volatile = (pte & UVM_GLM53_MAXWELL_PTE_VOL_MASK) ? 1 : 0;
+-    params->decoded_sys_address = (pte & UVM_GLM53_MAXWELL_PTE_ADDRESS_SYS_MASK) << 8;
+-}
+-
+-static bool glm53_serial_bar1_pte_is_sys_for_address(NvU64 pte,
+-                                                     NvU64 expected_address,
+-                                                     bool allow_writable)
++static bool glm53_maxwell_pte_is_sys_for_address(NvU64 pte,
++                                                 NvU64 expected_address,
++                                                 bool allow_writable)
+ {
+     NvU64 aperture = pte & UVM_GLM53_MAXWELL_PTE_APERTURE_MASK;
+     NvU64 expected_field =
+@@ -5768,40 +5842,81 @@
+            (aperture == (2ULL << 33) || aperture == (3ULL << 33)) &&
+            ((pte & UVM_GLM53_MAXWELL_PTE_ADDRESS_SYS_MASK) == expected_field) &&
+            !(pte & UVM_GLM53_MAXWELL_PTE_READ_DISABLE_MASK) &&
+-           (allow_writable ||
+-            ((pte & UVM_GLM53_MAXWELL_PTE_READ_ONLY_MASK) &&
+-             (pte & UVM_GLM53_MAXWELL_PTE_WRITE_DISABLE_MASK)));
++           (allow_writable ?
++                (!(pte & UVM_GLM53_MAXWELL_PTE_READ_ONLY_MASK) &&
++                 !(pte & UVM_GLM53_MAXWELL_PTE_WRITE_DISABLE_MASK)) :
++                ((pte & UVM_GLM53_MAXWELL_PTE_READ_ONLY_MASK) &&
++                 (pte & UVM_GLM53_MAXWELL_PTE_WRITE_DISABLE_MASK)));
++}
++
++// Validate a SYS PTE using the active requester's MMU HAL. This is necessary
++// for RTX-class VER2 PTEs, whose aperture and address fields differ from the
++// Maxwell encoding above. Exact comparison also rejects unrequested bits.
++static bool glm53_serial_bar1_pte_matches_hal(uvm_gpu_va_space_t *gpu_va_space,
++                                              NvU64 pte,
++                                              NvU64 expected_address,
++                                              bool allow_writable)
++{
++    uvm_prot_t prot = allow_writable ? UVM_PROT_READ_WRITE : UVM_PROT_READ_ONLY;
++    NvU64 expected_pte;
++
++    if (!gpu_va_space || !gpu_va_space->page_tables.hal)
++        return false;
++
++    expected_pte = gpu_va_space->page_tables.hal->make_pte(UVM_APERTURE_SYS,
++                                                           expected_address,
++                                                           prot,
++                                                           UVM_MMU_PTE_FLAGS_NONE);
++    return pte == expected_pte;
+ }
+ 
+ static void glm53_serial_bar1_fill_outputs(UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params)
+ {
++    if (!g_glm53_serial_bar1_peer_read_current)
++        return;
++
+     if (g_glm53_serial_bar1_peer_read_state.owner_active &&
+-        g_glm53_serial_bar1_peer_read_state.owner_gpu &&
+-        g_glm53_serial_bar1_peer_read_state.target_rm_mem) {
++        g_glm53_serial_bar1_peer_read_state.owner_gpu) {
+         params->owner_active = 1;
+         params->mapping_id = g_glm53_serial_bar1_peer_read_state.mapping_id;
+         params->active_length = g_glm53_serial_bar1_peer_read_state.length;
+         params->length = g_glm53_serial_bar1_peer_read_state.length;
+         params->gpu_alignment = g_glm53_serial_bar1_peer_read_state.gpu_alignment;
+         params->seed = g_glm53_serial_bar1_peer_read_state.seed;
+-        params->target_gpu_va =
+-            uvm_rm_mem_get_gpu_uvm_va(g_glm53_serial_bar1_peer_read_state.target_rm_mem,
+-                                      g_glm53_serial_bar1_peer_read_state.owner_gpu);
+-        params->target_cpu_va_kernel =
+-            (NvU64)(uintptr_t)uvm_rm_mem_get_cpu_va(g_glm53_serial_bar1_peer_read_state.target_rm_mem);
+-
+-        if (g_glm53_serial_bar1_peer_read_state.verify_rm_mem) {
+-            params->verify_gpu_va =
+-                uvm_rm_mem_get_gpu_uvm_va(g_glm53_serial_bar1_peer_read_state.verify_rm_mem,
++        glm53_serial_bar1_fill_gpu_outputs(g_glm53_serial_bar1_peer_read_state.owner_gpu, params);
++        if (g_glm53_serial_bar1_peer_read_state.target_rm_mem) {
++            params->target_gpu_va =
++                uvm_rm_mem_get_gpu_uvm_va(g_glm53_serial_bar1_peer_read_state.target_rm_mem,
+                                           g_glm53_serial_bar1_peer_read_state.owner_gpu);
+-            params->verify_cpu_va_kernel =
+-                (NvU64)(uintptr_t)uvm_rm_mem_get_cpu_va(g_glm53_serial_bar1_peer_read_state.verify_rm_mem);
+-        }
++            params->target_cpu_va_kernel =
++                (NvU64)(uintptr_t)uvm_rm_mem_get_cpu_va(g_glm53_serial_bar1_peer_read_state.target_rm_mem);
+ 
+-        glm53_serial_bar1_fill_gpu_outputs(g_glm53_serial_bar1_peer_read_state.owner_gpu, params);
+-        params->phys_query_status =
+-            glm53_serial_bar1_resolve_cpu_mapping(params,
+-                                                  g_glm53_serial_bar1_peer_read_state.target_rm_mem);
++            if (g_glm53_serial_bar1_peer_read_state.verify_rm_mem) {
++                params->verify_gpu_va =
++                    uvm_rm_mem_get_gpu_uvm_va(g_glm53_serial_bar1_peer_read_state.verify_rm_mem,
++                                              g_glm53_serial_bar1_peer_read_state.owner_gpu);
++                params->verify_cpu_va_kernel =
++                    (NvU64)(uintptr_t)uvm_rm_mem_get_cpu_va(g_glm53_serial_bar1_peer_read_state.verify_rm_mem);
++            }
++
++            params->phys_query_status =
++                glm53_serial_bar1_resolve_cpu_mapping(params,
++                                                      g_glm53_serial_bar1_peer_read_state.target_rm_mem);
++        }
++        else if (g_glm53_serial_bar1_peer_read_state.external_owner) {
++            NvU64 len = g_glm53_serial_bar1_peer_read_state.length;
++            params->owner_external = 1;
++            params->cpu_resource_start = g_glm53_serial_bar1_peer_read_state.mapped_resource_start;
++            params->cpu_resource_end = params->cpu_resource_start + len - 1;
++            params->matched_bar_index = 1;
++            params->matched_bar_full_coverage = 1;
++            params->allocation_bar_offset = g_glm53_serial_bar1_peer_read_state.external_owner_bar_offset;
++            params->allocation_bar_bus_start = g_glm53_serial_bar1_peer_read_state.external_owner_bus_start;
++            params->allocation_bar_bus_end = params->allocation_bar_bus_start + len - 1;
++            params->allocation_bar_bus_offset = 0;
++            params->allocation_bar_bus_valid = 1;
++            params->phys_query_status = NV_OK;
++        }
+     }
+ 
+     if (g_glm53_serial_bar1_peer_read_state.dma_active) {
+@@ -5855,7 +5970,6 @@
+         params->active_target_va = g_glm53_serial_bar1_peer_read_state.target_va;
+         params->destination_gpu_sys_address =
+             g_glm53_serial_bar1_peer_read_state.destination_gpu_sys_address;
+-        glm53_serial_bar1_decode_pte_outputs(params, g_glm53_serial_bar1_peer_read_state.temporary_pte);
+         if (g_glm53_serial_bar1_peer_read_state.remap_gpu_va_space) {
+             params->retained_gpu_va_space_state =
+                 uvm_gpu_va_space_state(g_glm53_serial_bar1_peer_read_state.remap_gpu_va_space);
+@@ -6044,6 +6158,83 @@
+     return status;
+ }
+ 
++// Retain the owner GPU while userspace holds an RM-reflected mapping of an
++// existing CUDA VMM allocation. Validate the CPU resource and bus-address
++// interval as the same BAR1 offset; userspace remains responsible for keeping
++// the CUDA allocation and RM mapping alive until RELEASE_OWNER.
++static NV_STATUS glm53_serial_bar1_acquire_external_owner_locked(
++    UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params,
++    struct file *filp)
++{
++    uvm_va_space_t *va_space = uvm_va_space_get(filp);
++    uvm_gpu_t *owner_gpu = NULL;
++    struct pci_dev *pci_dev;
++    NvU64 length = params->requested_resource_length;
++    NvU64 requested_cpu = params->requested_cpu_resource_start;
++    NvU64 requested_bus = params->requested_owner_bar1_bus_start;
++    NvU64 cpu_base, bus_base, bar_len, bar_offset;
++    NV_STATUS status = NV_OK;
++
++    if (g_glm53_serial_bar1_peer_read_state.owner_active)
++        return NV_ERR_STATE_IN_USE;
++    if (length < UVM_PAGE_SIZE_64K || length > UVM_GLM53_PEER_READ_REMAP_PAGE_SIZE ||
++        (length % UVM_PAGE_SIZE_4K) != 0 || (requested_cpu % UVM_PAGE_SIZE_4K) != 0 ||
++        (requested_bus % UVM_PAGE_SIZE_4K) != 0)
++        return NV_ERR_INVALID_LIMIT;
++
++    owner_gpu = uvm_va_space_retain_gpu_by_uuid(va_space, &params->owner_uuid);
++    if (!owner_gpu || !owner_gpu->parent || !owner_gpu->parent->pci_dev) {
++        status = NV_ERR_INVALID_DEVICE;
++        goto done;
++    }
++
++    pci_dev = owner_gpu->parent->pci_dev;
++    cpu_base = pci_resource_start(pci_dev, 1);
++    bus_base = pci_bus_address(pci_dev, 1);
++    bar_len = pci_resource_len(pci_dev, 1);
++    if (cpu_base == 0 || bus_base == 0 || bar_len == 0 || requested_bus < bus_base) {
++        status = NV_ERR_NOT_SUPPORTED;
++        goto done;
++    }
++
++    bar_offset = requested_bus - bus_base;
++    if (bar_offset > bar_len || length > bar_len - bar_offset ||
++        cpu_base > U64_MAX - bar_offset ||
++        (requested_cpu != 0 && requested_cpu != cpu_base + bar_offset) ||
++        length - 1 > U64_MAX - (cpu_base + bar_offset) ||
++        cpu_base + bar_offset + length - 1 > pci_resource_end(pci_dev, 1)) {
++        status = NV_ERR_INVALID_ADDRESS;
++        goto done;
++    }
++    requested_cpu = cpu_base + bar_offset;
++
++    memset(&g_glm53_serial_bar1_peer_read_state, 0,
++           sizeof(g_glm53_serial_bar1_peer_read_state));
++    g_glm53_serial_bar1_peer_read_state.owner_active = true;
++    g_glm53_serial_bar1_peer_read_state.external_owner = true;
++    g_glm53_serial_bar1_peer_read_state.mapping_id =
++        g_glm53_serial_bar1_peer_read_next_mapping_id++;
++    if (g_glm53_serial_bar1_peer_read_next_mapping_id == 0)
++        g_glm53_serial_bar1_peer_read_next_mapping_id = 1;
++    uvm_uuid_copy(&g_glm53_serial_bar1_peer_read_state.owner_uuid, &params->owner_uuid);
++    uvm_uuid_copy(&g_glm53_serial_bar1_peer_read_state.requester_uuid, &params->requester_uuid);
++    g_glm53_serial_bar1_peer_read_state.owner_gpu = owner_gpu;
++    g_glm53_serial_bar1_peer_read_state.length = length;
++    g_glm53_serial_bar1_peer_read_state.gpu_alignment = UVM_PAGE_SIZE_4K;
++    g_glm53_serial_bar1_peer_read_state.mapped_resource_start = requested_cpu;
++    g_glm53_serial_bar1_peer_read_state.mapped_resource_end = requested_cpu + length - 1;
++    g_glm53_serial_bar1_peer_read_state.external_owner_bus_start = requested_bus;
++    g_glm53_serial_bar1_peer_read_state.external_owner_bar_offset = bar_offset;
++    params->mapping_id = g_glm53_serial_bar1_peer_read_state.mapping_id;
++    owner_gpu = NULL;
++    glm53_serial_bar1_fill_outputs(params);
++
++done:
++    if (owner_gpu)
++        uvm_gpu_release(owner_gpu);
++    return status;
++}
++
+ static NV_STATUS glm53_serial_bar1_check_owner_epoch_locked(UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params,
+                                                            bool fill_target_first)
+ {
+@@ -6316,7 +6507,7 @@
+ }
+ 
+ static NV_STATUS glm53_serial_bar1_find_and_lock_gpu_va_space(
+-    const UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params,
++    UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params,
+     uvm_va_space_t **out_va_space,
+     uvm_gpu_va_space_t **out_gpu_va_space,
+     uvm_gpu_t **out_gpu)
+@@ -6335,6 +6526,7 @@
+         uvm_gpu_t *gpu;
+         uvm_page_tree_t *tree;
+         uvm_gpu_phys_address_t root_phys;
++        NvU32 pte_entry_size;
+ 
+         if ((NvU64)(uintptr_t)va_space != params->va_space_ptr)
+             continue;
+@@ -6383,14 +6575,60 @@
+             goto unlock_va_space;
+         }
+ 
+-        if ((params->target_va % params->page_size) != 0 ||
+-            (params->target_pte_phys % UVM_GLM53_MAXWELL_PTE_ENTRY_SIZE) != 0) {
++        if ((params->target_va % params->page_size) != 0) {
++            status = NV_ERR_INVALID_ADDRESS;
++            goto unlock_va_space;
++        }
++
++        // Resolve the leaf through UVM's page-tree HAL when the caller asks
++        // for an automatic lookup. This avoids assuming Maxwell VA indexes
++        // for requesters such as Turing/Ampere. The existing physical reader
++        // and PTE batch writer support only 8-byte entries in VIDMEM.
++        pte_entry_size = tree->hal->entry_size(tree->hal->page_table_depth(params->page_size));
++        if (pte_entry_size != UVM_GLM53_MAXWELL_PTE_ENTRY_SIZE) {
++            status = NV_ERR_NOT_SUPPORTED;
++            goto unlock_va_space;
++        }
++
++        if (params->target_pte_phys == 0) {
++            uvm_page_table_range_t leaf_range = {};
++            uvm_gpu_phys_address_t leaf_phys;
++            NvU64 entry_offset;
++
++            status = uvm_page_tree_get_entry(tree,
++                                             params->page_size,
++                                             params->target_va,
++                                             UVM_PMM_ALLOC_FLAGS_NONE,
++                                             &leaf_range);
++            if (status != NV_OK)
++                goto unlock_va_space;
++
++            leaf_phys = leaf_range.table->phys_alloc.addr;
++            if (leaf_phys.aperture != UVM_APERTURE_VID ||
++                leaf_range.start_index > U64_MAX / pte_entry_size) {
++                uvm_page_tree_put_ptes(tree, &leaf_range);
++                status = NV_ERR_NOT_SUPPORTED;
++                goto unlock_va_space;
++            }
++
++            entry_offset = (NvU64)leaf_range.start_index * pte_entry_size;
++            if (leaf_phys.address > U64_MAX - entry_offset) {
++                uvm_page_tree_put_ptes(tree, &leaf_range);
++                status = NV_ERR_INVALID_LIMIT;
++                goto unlock_va_space;
++            }
++
++            params->target_pte_phys = leaf_phys.address + entry_offset;
++            uvm_page_tree_put_ptes(tree, &leaf_range);
++        }
++
++        if ((params->target_pte_phys % pte_entry_size) != 0) {
+             status = NV_ERR_INVALID_ADDRESS;
+             goto unlock_va_space;
+         }
+ 
+         if (params->target_pte_phys >= gpu->mem_info.size ||
+-            UVM_GLM53_MAXWELL_PTE_ENTRY_SIZE > gpu->mem_info.size - params->target_pte_phys) {
++            pte_entry_size > gpu->mem_info.size - params->target_pte_phys) {
+             status = NV_ERR_INVALID_LIMIT;
+             goto unlock_va_space;
+         }
+@@ -6410,6 +6648,39 @@
+     return status;
+ }
+ 
++static NV_STATUS glm53_serial_bar1_query_requester_pte_locked(
++    UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params)
++{
++    uvm_va_space_t *va_space = NULL;
++    uvm_gpu_va_space_t *gpu_va_space = NULL;
++    uvm_gpu_t *gpu = NULL;
++    NvU64 pte = 0;
++    NV_STATUS status;
++
++    if (params->root_phys_aperture != UVM_APERTURE_VID)
++        return NV_ERR_NOT_SUPPORTED;
++
++    status = glm53_serial_bar1_find_and_lock_gpu_va_space(params,
++                                                           &va_space,
++                                                           &gpu_va_space,
++                                                           &gpu);
++    if (status != NV_OK)
++        return status;
++
++    status = glm53_read_phys_vidmem_u64(gpu, params->target_pte_phys, &pte);
++    if (status == NV_OK) {
++        params->pte_before = pte;
++        params->pte_after = pte;
++        params->saved_original_pte = pte;
++        params->active_target_pte_phys = params->target_pte_phys;
++        params->active_target_va = params->target_va;
++        params->retained_gpu_va_space_state = uvm_gpu_va_space_state(gpu_va_space);
++    }
++
++    uvm_va_space_up_read(va_space);
++    return status;
++}
++
+ static NV_STATUS glm53_serial_bar1_remap_locked(UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS *params)
+ {
+     uvm_va_space_t *target_va_space = NULL;
+@@ -6422,8 +6693,9 @@
+ 
+     if (params->op == UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_REMAP_APPLY) {
+         bool custom_pte = params->requested_temporary_pte != 0;
++        bool explicit_destination = params->requested_destination_gpu_sys_address != 0;
+ 
+-        if (!g_glm53_serial_bar1_peer_read_state.dma_active && !custom_pte)
++        if (!g_glm53_serial_bar1_peer_read_state.dma_active && !custom_pte && !explicit_destination)
+             return NV_ERR_INVALID_STATE;
+         if (g_glm53_serial_bar1_peer_read_state.remap_active)
+             return NV_ERR_STATE_IN_USE;
+@@ -6457,6 +6729,10 @@
+         params->requested_temporary_pte != 0) {
+         params->destination_gpu_sys_address = params->requested_destination_gpu_sys_address;
+     }
++    else if (params->op == UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_REMAP_APPLY &&
++             params->requested_destination_gpu_sys_address != 0) {
++        params->destination_gpu_sys_address = params->requested_destination_gpu_sys_address;
++    }
+     else if (g_glm53_serial_bar1_peer_read_state.dma_active) {
+         params->destination_gpu_sys_address =
+             g_glm53_serial_bar1_peer_read_state.destination_gpu_sys_address;
+@@ -6509,13 +6785,14 @@
+         else {
+             new_pte = gpu_va_space->page_tables.hal->make_pte(UVM_APERTURE_SYS,
+                                                               params->destination_gpu_sys_address,
+-                                                              UVM_PROT_READ_ONLY,
++                                                              params->requested_allow_writable ?
++                                                                  UVM_PROT_READ_WRITE : UVM_PROT_READ_ONLY,
+                                                               UVM_MMU_PTE_FLAGS_NONE);
+         }
+-        glm53_serial_bar1_decode_pte_outputs(params, new_pte);
+-        if (!glm53_serial_bar1_pte_is_sys_for_address(new_pte,
+-                                                      params->destination_gpu_sys_address,
+-                                                      params->requested_allow_writable != 0)) {
++        if (!glm53_serial_bar1_pte_matches_hal(gpu_va_space,
++                                               new_pte,
++                                               params->destination_gpu_sys_address,
++                                               params->requested_allow_writable != 0)) {
+             status = NV_ERR_NOT_SUPPORTED;
+             goto unlock_va_space;
+         }
+@@ -6537,7 +6814,6 @@
+         }
+ 
+         new_pte = g_glm53_serial_bar1_peer_read_state.original_pte;
+-        glm53_serial_bar1_decode_pte_outputs(params, current_pte);
+     }
+ 
+     status = glm53_write_pte_and_invalidate(gpu_va_space,
+@@ -6647,6 +6923,9 @@
+     NvU64 requested_temporary_pte = params->requested_temporary_pte;
+     NvU64 requested_destination_gpu_sys_address = params->requested_destination_gpu_sys_address;
+     NvU32 requested_allow_writable = params->requested_allow_writable;
++    NvU64 requested_cpu_resource_start = params->requested_cpu_resource_start;
++    NvU64 requested_owner_bar1_bus_start = params->requested_owner_bar1_bus_start;
++    NvU64 requested_resource_length = params->requested_resource_length;
+     NV_STATUS status = NV_OK;
+ 
+     memset(params, 0, sizeof(*params));
+@@ -6671,6 +6950,9 @@
+     params->requested_temporary_pte = requested_temporary_pte;
+     params->requested_destination_gpu_sys_address = requested_destination_gpu_sys_address;
+     params->requested_allow_writable = requested_allow_writable;
++    params->requested_cpu_resource_start = requested_cpu_resource_start;
++    params->requested_owner_bar1_bus_start = requested_owner_bar1_bus_start;
++    params->requested_resource_length = requested_resource_length;
+     params->matched_bar_index = UVM_GLM53_RM_CPUMAP_PHYS_BAR_NONE;
+     params->dma_direction = DMA_BIDIRECTIONAL;
+     params->dma_api_path = UVM_GLM53_SERIAL_BAR1_DMA_API_DIRECT_DMA_MAP_RESOURCE;
+@@ -6680,6 +6962,30 @@
+ 
+     mutex_lock(&g_glm53_serial_bar1_peer_read_mutex);
+ 
++    g_glm53_serial_bar1_peer_read_current = NULL;
++    if (op == UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_ACQUIRE_OWNER ||
++        op == UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_ACQUIRE_EXTERNAL_OWNER) {
++        g_glm53_serial_bar1_peer_read_current = glm53_serial_bar1_find_free_state();
++        if (!g_glm53_serial_bar1_peer_read_current) {
++            status = NV_ERR_INSUFFICIENT_RESOURCES;
++            goto done;
++        }
++    }
++    else if (mapping_id != 0) {
++        g_glm53_serial_bar1_peer_read_current = glm53_serial_bar1_find_mapping_state(mapping_id);
++    }
++    else if (op != UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY_REQUESTER_PTE) {
++        g_glm53_serial_bar1_peer_read_current =
++            glm53_serial_bar1_find_uuid_state(&requester_uuid, &owner_uuid);
++    }
++
++    if (op != UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY &&
++        op != UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY_REQUESTER_PTE &&
++        !g_glm53_serial_bar1_peer_read_current) {
++        status = NV_ERR_OBJECT_NOT_FOUND;
++        goto done;
++    }
++
+     switch (op) {
+         case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY:
+             status = NV_OK;
+@@ -6687,12 +6993,18 @@
+         case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_ACQUIRE_OWNER:
+             status = glm53_serial_bar1_acquire_owner_locked(params, filp);
+             break;
++        case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_ACQUIRE_EXTERNAL_OWNER:
++            status = glm53_serial_bar1_acquire_external_owner_locked(params, filp);
++            break;
+         case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_PREPARE_OWNER_EPOCH:
+             status = glm53_serial_bar1_prepare_owner_epoch_locked(params);
+             break;
+         case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_VERIFY_OWNER_EPOCH:
+             status = glm53_serial_bar1_verify_owner_epoch_locked(params);
+             break;
++        case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY_REQUESTER_PTE:
++            status = glm53_serial_bar1_query_requester_pte_locked(params);
++            break;
+         case UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_DMA_MAP_REQUESTER:
+             status = glm53_serial_bar1_dma_map_requester_locked(params, filp);
+             break;
+@@ -6711,8 +7023,10 @@
+             break;
+     }
+ 
++done:
+     glm53_serial_bar1_fill_outputs(params);
+     params->rmStatus = status;
++    g_glm53_serial_bar1_peer_read_current = NULL;
+     mutex_unlock(&g_glm53_serial_bar1_peer_read_mutex);
+ 
+     return status;
+@@ -6734,6 +7048,7 @@
+     NvU64 original_pte;
+     NvU64 temporary_pte;
+     NvU64 destination_gpu_sys_address;
++    bool maxwell_pte_format;
+ } glm53_multi_pte_remap_state_t;
+ 
+ static DEFINE_MUTEX(g_glm53_multi_pte_remap_mutex);
+@@ -6753,8 +7068,22 @@
+     return count;
+ }
+ 
+-static void glm53_multi_pte_decode_pte_outputs(UVM_GLM53_MULTI_PTE_REMAP_PARAMS *params, NvU64 pte)
+-{
++static void glm53_multi_pte_decode_pte_outputs(UVM_GLM53_MULTI_PTE_REMAP_PARAMS *params,
++                                               NvU64 pte,
++                                               bool maxwell_pte_format)
++{
++    // The UAPI's decoded_* fields describe the diagnostic Maxwell format only.
++    // RTX/Turing uses VER2 PTE fields; leave these zero rather than mislabeling
++    // VER2 bits as Maxwell aperture/kind/permission fields. Raw PTE remains exact.
++    params->decoded_aperture_bits = 0;
++    params->decoded_kind = 0;
++    params->decoded_read_only = 0;
++    params->decoded_read_disable = 0;
++    params->decoded_write_disable = 0;
++    params->decoded_volatile = 0;
++    if (!maxwell_pte_format)
++        return;
++
+     params->decoded_aperture_bits = (NvU32)((pte & UVM_GLM53_MAXWELL_PTE_APERTURE_MASK) >> 33);
+     params->decoded_kind = (NvU32)((pte & UVM_GLM53_MAXWELL_PTE_KIND_MASK) >> 36);
+     params->decoded_read_only = (pte & UVM_GLM53_MAXWELL_PTE_READ_ONLY_MASK) ? 1 : 0;
+@@ -6789,7 +7118,7 @@
+     params->temporary_pte = entry->temporary_pte;
+     params->active_destination_gpu_sys_address = entry->destination_gpu_sys_address;
+     params->requested_destination_gpu_sys_address = entry->destination_gpu_sys_address;
+-    glm53_multi_pte_decode_pte_outputs(params, entry->temporary_pte);
++    glm53_multi_pte_decode_pte_outputs(params, entry->temporary_pte, entry->maxwell_pte_format);
+     if (entry->gpu_va_space)
+         params->retained_gpu_va_space_state = uvm_gpu_va_space_state(entry->gpu_va_space);
+ }
+@@ -6897,6 +7226,7 @@
+     NvU64 current_pte = 0;
+     NvU64 new_pte = params->requested_temporary_pte;
+     NvU32 free_slot = UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE;
++    bool local_volatile_pte = false;
+     NvU32 i;
+     NV_STATUS status;
+ 
+@@ -6948,16 +7278,22 @@
+         goto unlock_va_space;
+     }
+ 
+-    if (!glm53_serial_bar1_pte_is_sys_for_address(new_pte,
+-                                                  params->requested_destination_gpu_sys_address,
+-                                                  params->requested_allow_writable != 0)) {
++    local_volatile_pte =
++        glm53_validate_local_pte_volatile_change(current_pte, new_pte) == NV_OK;
++
++    if (!local_volatile_pte &&
++        !glm53_serial_bar1_pte_matches_hal(gpu_va_space,
++                                           new_pte,
++                                           params->requested_destination_gpu_sys_address,
++                                           params->requested_allow_writable != 0)) {
+         params->pte_validation_status = NV_ERR_NOT_SUPPORTED;
+         status = params->pte_validation_status;
+         goto unlock_va_space;
+     }
+     params->pte_validation_status = NV_OK;
+ 
+-    params->requester_l2_invalidate_status = uvm_mmu_l2_invalidate(gpu, UVM_APERTURE_SYS);
++    params->requester_l2_invalidate_status =
++        uvm_mmu_l2_invalidate(gpu, local_volatile_pte ? UVM_APERTURE_VID : UVM_APERTURE_SYS);
+     if (params->requester_l2_invalidate_status != NV_OK) {
+         status = params->requester_l2_invalidate_status;
+         goto unlock_va_space;
+@@ -7008,6 +7344,9 @@
+     g_glm53_multi_pte_remap_state[free_slot].temporary_pte = new_pte;
+     g_glm53_multi_pte_remap_state[free_slot].destination_gpu_sys_address =
+         params->requested_destination_gpu_sys_address;
++    g_glm53_multi_pte_remap_state[free_slot].maxwell_pte_format =
++        gpu->parent->rm_info.gpuArch == NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GM000 ||
++        gpu->parent->rm_info.gpuArch == NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GM200;
+ 
+     params->mapping_id = g_glm53_multi_pte_remap_state[free_slot].mapping_id;
+     glm53_multi_pte_fill_entry_outputs(params, free_slot);
+@@ -7027,6 +7366,7 @@
+     NvU64 current_pte = 0;
+     NvU64 restored_pte = 0;
+     NvU32 slot = UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE;
++    bool local_volatile_pte = false;
+     NvU32 i;
+     NV_STATUS status;
+ 
+@@ -7084,7 +7424,11 @@
+         goto unlock_va_space;
+     }
+ 
+-    params->requester_l2_invalidate_status = uvm_mmu_l2_invalidate(gpu, UVM_APERTURE_SYS);
++    local_volatile_pte =
++        glm53_validate_local_pte_volatile_change(saved.original_pte, saved.temporary_pte) == NV_OK;
++
++    params->requester_l2_invalidate_status =
++        uvm_mmu_l2_invalidate(gpu, local_volatile_pte ? UVM_APERTURE_VID : UVM_APERTURE_SYS);
+     if (params->requester_l2_invalidate_status != NV_OK) {
+         status = params->requester_l2_invalidate_status;
+         goto unlock_va_space;
+@@ -7126,7 +7470,7 @@
+     params->active_target_va = saved.target_va;
+     params->active_target_pte_phys = saved.target_pte_phys;
+     params->active_destination_gpu_sys_address = saved.destination_gpu_sys_address;
+-    glm53_multi_pte_decode_pte_outputs(params, saved.temporary_pte);
++    glm53_multi_pte_decode_pte_outputs(params, saved.temporary_pte, saved.maxwell_pte_format);
+ 
+     uvm_gpu_va_space_release(saved.gpu_va_space);
+     memset(&g_glm53_multi_pte_remap_state[slot], 0, sizeof(g_glm53_multi_pte_remap_state[slot]));
+@@ -7211,3 +7555,65 @@
+ 
+     return status;
+ }
++
++NV_STATUS uvm_api_glm53_local_cache_sync(UVM_GLM53_LOCAL_CACHE_SYNC_PARAMS *params, struct file *filp)
++{
++    NvProcessorUuid gpu_uuid = params->gpu_uuid;
++    NvU32 op = params->op;
++    NvU32 aperture = params->aperture;
++    NvU32 do_phys_tlb_invalidate = params->do_phys_tlb_invalidate;
++    uvm_va_space_t *va_space = uvm_va_space_get(filp);
++    uvm_gpu_t *gpu = NULL;
++    uvm_aperture_t uvm_aperture;
++    NV_STATUS status = NV_OK;
++
++    memset(params, 0, sizeof(*params));
++    params->gpu_uuid = gpu_uuid;
++    params->op = op;
++    params->aperture = aperture;
++    params->do_phys_tlb_invalidate = do_phys_tlb_invalidate;
++    params->l2_invalidate_status = NV_OK;
++    params->phys_tlb_invalidate_status = NV_OK;
++
++    if (!capable(CAP_SYS_RAWIO))
++        return NV_ERR_INSUFFICIENT_PERMISSIONS;
++
++    if (op != UVM_GLM53_LOCAL_CACHE_SYNC_OP_SYNC) {
++        status = NV_ERR_INVALID_ARGUMENT;
++        goto done;
++    }
++
++    if (aperture == UVM_GLM53_LOCAL_CACHE_SYNC_APERTURE_VID)
++        uvm_aperture = UVM_APERTURE_VID;
++    else if (aperture == UVM_GLM53_LOCAL_CACHE_SYNC_APERTURE_SYS)
++        uvm_aperture = UVM_APERTURE_SYS;
++    else {
++        status = NV_ERR_NOT_SUPPORTED;
++        goto done;
++    }
++
++    gpu = uvm_va_space_retain_gpu_by_uuid(va_space, &gpu_uuid);
++    if (!gpu) {
++        status = NV_ERR_INVALID_DEVICE;
++        goto done;
++    }
++    params->retained_gpu = 1;
++
++    params->l2_invalidate_status = uvm_mmu_l2_invalidate(gpu, uvm_aperture);
++    if (params->l2_invalidate_status != NV_OK) {
++        status = params->l2_invalidate_status;
++        goto done;
++    }
++
++    if (do_phys_tlb_invalidate) {
++        params->phys_tlb_invalidate_status = uvm_mmu_tlb_invalidate_phys(gpu);
++        if (params->phys_tlb_invalidate_status != NV_OK)
++            status = params->phys_tlb_invalidate_status;
++    }
++
++done:
++    if (gpu)
++        uvm_gpu_release(gpu);
++    params->rmStatus = status;
++    return status;
++}
+--- a/nvidia-uvm/uvm_ioctl.h
++++ b/nvidia-uvm/uvm_ioctl.h
+@@ -1216,6 +1216,7 @@
+ #define UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY                            1U
+ #define UVM_GLM53_LOCAL_PTE_REMAP_OP_RESTORE                          2U
+ #define UVM_GLM53_LOCAL_PTE_REMAP_OP_QUERY                            3U
++#define UVM_GLM53_LOCAL_PTE_REMAP_OP_APPLY_VOLATILE                   4U
+ 
+ typedef struct
+ {
+@@ -1546,6 +1547,8 @@
+ #define UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_REMAP_RESTORE               7U
+ #define UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_RELEASE_OWNER               8U
+ #define UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_VERIFY_OWNER_EPOCH          9U
++#define UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_QUERY_REQUESTER_PTE        10U
++#define UVM_GLM53_SERIAL_BAR1_PEER_READ_OP_ACQUIRE_EXTERNAL_OWNER     11U
+ #define UVM_GLM53_SERIAL_BAR1_DMA_API_DIRECT_DMA_MAP_RESOURCE          1U
+ 
+ typedef struct
+@@ -1682,6 +1685,15 @@
+     UVM_GLM53_RM_CPUMAP_PHYS_COMPARE_RESULT owner_forward;             // OUT
+ 
+     NV_STATUS       rmStatus;                                           // OUT
++
++    // Inputs/outputs for a caller-retained RM-reflected BAR1 mapping. The
++    // userspace owner keeps the CUDA/RM allocation and reflected mapping
++    // alive; UVM validates this range against the owner's BAR1 resource and
++    // retains the owner GPU reference while requester DMA mapping is active.
++    NvU64           requested_cpu_resource_start   NV_ALIGN_BYTES(8);   // IN
++    NvU64           requested_owner_bar1_bus_start NV_ALIGN_BYTES(8);   // IN
++    NvU64           requested_resource_length      NV_ALIGN_BYTES(8);   // IN
++    NvU32           owner_external;                                     // OUT
+ } UVM_GLM53_SERIAL_BAR1_PEER_READ_PARAMS;
+ 
+ //
+@@ -1695,7 +1707,7 @@
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_QUERY                             1U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_APPLY                             2U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_RESTORE                           3U
+-#define UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE                           32U
++#define UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE                           128U
+ 
+ typedef struct
+ {
+@@ -1750,6 +1762,33 @@
+ } UVM_GLM53_MULTI_PTE_REMAP_PARAMS;
+ 
+ //
++// GLM53 bounded cache synchronization diagnostic. This does not alter PTEs or
++// mappings. It exposes the UVM L2 invalidate helper for one retained GPU so a
++// resident-kernel visibility test can distinguish payload-cache staleness from
++// command-publication bugs.
++//
++#define UVM_GLM53_LOCAL_CACHE_SYNC                                     UVM_IOCTL_BASE(92)
++#define UVM_GLM53_LOCAL_CACHE_SYNC_OP_SYNC                             1U
++#define UVM_GLM53_LOCAL_CACHE_SYNC_APERTURE_VID                        1U
++#define UVM_GLM53_LOCAL_CACHE_SYNC_APERTURE_SYS                        2U
++#define UVM_GLM53_LOCAL_CACHE_SYNC_APERTURE_SYS_NON_COHERENT           3U
++
++typedef struct
++{
++    NvProcessorUuid gpu_uuid;                                           // IN
++    NvU32           op;                                                 // IN
++    NvU32           aperture;                                           // IN
++    NvU32           do_phys_tlb_invalidate;                             // IN
++
++    NvU32           retained_gpu;                                       // OUT
++    NvU32           reserved0;                                          // OUT
++
++    NV_STATUS       l2_invalidate_status;                               // OUT
++    NV_STATUS       phys_tlb_invalidate_status;                         // OUT
++    NV_STATUS       rmStatus;                                           // OUT
++} UVM_GLM53_LOCAL_CACHE_SYNC_PARAMS;
++
++//
+ // Temporary ioctls which should be removed before UVM 8 release
+ // Number backwards from 2047 - highest custom ioctl function number
+ // windows can handle.

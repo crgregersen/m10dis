@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+# Resolve kernel-assigned hwmon numbers to stable runtime paths.
+
+set -Eeuo pipefail
+
+resolve_one()
+{
+	local name=$1 link=$2
+	shift 2
+	local target attribute
+	local -a matches
+
+	mapfile -t matches < <(/usr/bin/grep -lFx "$name" /sys/class/hwmon/hwmon*/name 2>/dev/null || true)
+	if (( ${#matches[@]} != 1 )); then
+		printf 'Expected exactly one %s hwmon device; found %d\n' "$name" "${#matches[@]}" >&2
+		return 1
+	fi
+
+	target=${matches[0]%/name}
+	for attribute in "$@"; do
+		[[ -e $target/$attribute ]] || {
+			printf 'Required attribute is missing: %s/%s\n' "$target" "$attribute" >&2
+			return 1
+		}
+	done
+
+	if [[ -e $link && ! -L $link ]]; then
+		printf 'Refusing to replace non-symlink path: %s\n' "$link" >&2
+		return 1
+	fi
+
+	# Avoid replacing an already-correct root-owned symlink while still
+	# repairing stale hwmon-number links after module reloads.
+	if [[ ! -L $link || $(/usr/bin/readlink -f "$link") != $(/usr/bin/readlink -f "$target") ]]; then
+		/usr/bin/ln -sfn "$target" "$link"
+	fi
+}
+
+resolve_one nct6683 /run/m10-hwmon \
+	pwm1 pwm1_enable fan1_input pwm3 pwm3_enable fan4_input
+
+[[ -w /run/m10-hwmon/pwm1 && -w /run/m10-hwmon/pwm1_enable && \
+   -w /run/m10-hwmon/pwm3 && -w /run/m10-hwmon/pwm3_enable ]] || {
+	printf 'M10 motherboard PWM attributes are not writable; patched nct6683 is not active\n' >&2
+	exit 1
+}
+
+resolve_one arctic_fan /run/m10-arctic-hwmon \
+	pwm1 fan1_input pwm2 fan2_input pwm3 fan3_input pwm4 fan4_input
+
+[[ -w /run/m10-arctic-hwmon/pwm1 && -w /run/m10-arctic-hwmon/pwm2 && -w /run/m10-arctic-hwmon/pwm3 && -w /run/m10-arctic-hwmon/pwm4 ]] || {
+	printf 'M10 Arctic PWM attributes are not writable\n' >&2
+	exit 1
+}

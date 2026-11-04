@@ -1,0 +1,1 @@
+MMLU_SCORE,items_scored,2628,items_total,5330,accuracy,90.98,stderr,0.56,macro_subject_avg,90.67,subjects,57,no_letter,0,duplicate_ids,0,unknown_ids,0,preds,A:585/B:651/C:688/D:704

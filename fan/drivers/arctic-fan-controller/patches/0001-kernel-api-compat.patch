@@ -1,0 +1,13 @@
+Index: build/arctic_fan_controller.c
+===================================================================
+--- build.orig/arctic_fan_controller.c	2026-09-21 22:53:01.693033634 +0000
++++ build/arctic_fan_controller.c	2026-09-21 22:54:48.662831629 +0000
+@@ -19,7 +19,7 @@
+ #include <linux/module.h>
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
+-#include <linux/unaligned.h>
++#include <asm/unaligned.h>
+ 
+ #define ARCTIC_VID			0x3904
+ #define ARCTIC_PID			0xF001

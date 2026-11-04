@@ -1,0 +1,81 @@
+From: Aureo Serrano de Souza <aureo.serrano@arctic.de>
+Subject: hwmon: arctic_fan_controller: default PWM cache to MCU 40%
+Date: Thu, 10 Sep 2026 13:03:59 +0800
+
+The device has no GET_REPORT and every OUT report carries all 10
+channels, so the cache has to start at some value. Starting at 0
+means the first sysfs write to a single channel also sends 0% on
+the other nine.
+
+The MCU factory default is 40%. Initialize pwm_duty[] to 102 (40%
+on the 0-255 sysfs scale) at probe and on reset-resume. Any initial
+cache can be stale if the module is reloaded without a device
+reset. 40% matches the hardware after power-on or power-loss
+resume, and a first single-channel write leaves the fans running
+at a safe speed.
+
+PWM is still not taken from periodic IN reports: the device is
+manual-only and the host cache stays authoritative after the first
+successful write.
+
+Signed-off-by: Aureo Serrano de Souza <aureo.serrano@arctic.de>
+---
+ Documentation/hwmon/arctic_fan_controller.rst | 26 +++++++++----------
+ drivers/hwmon/arctic_fan_controller.c         | 18 ++++++++-----
+ 2 files changed, 23 insertions(+), 21 deletions(-)
+
+ ================ ==============================================================
+diff --git a/drivers/hwmon/arctic_fan_controller.c b/drivers/hwmon/arctic_fan_controller.c
+index dbe84cd93c0..9a609257273 100644
+--- a/drivers/hwmon/arctic_fan_controller.c
++++ b/drivers/hwmon/arctic_fan_controller.c
+@@ -35,6 +35,8 @@
+  * Measured over 500 iterations: max ~563 ms. Keep 1 s as margin.
+  */
+ #define ARCTIC_ACK_TIMEOUT_MS		1000
++/* MCU factory default; 40% of 0-255 is 102. */
++#define ARCTIC_PWM_DEFAULT		102
+ 
+ struct arctic_fan_data {
+ 	struct hid_device *hdev;
+@@ -164,7 +166,7 @@ static int arctic_fan_write(struct device *dev, enum hwmon_sensor_types type,
+ 
+ 	/*
+ 	 * Build the buffer and arm write_pending under in_report_lock so that
+-	 * reset_resume() cannot clear pwm_duty[] between the pwm_duty[] read
++	 * reset_resume() cannot replace pwm_duty[] between the pwm_duty[] read
+ 	 * and the buffer write, and raw_event() cannot deliver a stale ACK
+ 	 * from a previous write into this write's completion.
+ 	 *
+@@ -256,14 +258,14 @@ static int arctic_fan_reset_resume(struct hid_device *hdev)
+ 	unsigned long flags;
+ 
+ 	/*
+-	 * The device resets its PWM channels to hardware defaults on power
+-	 * loss during suspend. Clear the cached duty values so they reflect
+-	 * the unknown hardware state, consistent with probe-time behaviour
+-	 * (the device has no GET_REPORT support). Hold in_report_lock so
+-	 * this does not race with a concurrent pwm read or write callback.
++	 * The device resets its PWM channels to the MCU factory default
++	 * (40%) on power loss during suspend. Restore the cache to that
++	 * same default, consistent with probe-time behaviour (the device
++	 * has no GET_REPORT support). Hold in_report_lock so this does
++	 * not race with a concurrent pwm read or write callback.
+ 	 */
+ 	spin_lock_irqsave(&priv->in_report_lock, flags);
+-	memset(priv->pwm_duty, 0, sizeof(priv->pwm_duty));
++	memset(priv->pwm_duty, ARCTIC_PWM_DEFAULT, sizeof(priv->pwm_duty));
+ 	spin_unlock_irqrestore(&priv->in_report_lock, flags);
+ 	return 0;
+ }
+@@ -288,6 +290,8 @@ static int arctic_fan_probe(struct hid_device *hdev,
+ 	priv->hdev = hdev;
+ 	spin_lock_init(&priv->in_report_lock);
+ 	init_completion(&priv->in_report_received);
++	/* Same MCU factory default as reset_resume(); see ARCTIC_PWM_DEFAULT above. */
++	memset(priv->pwm_duty, ARCTIC_PWM_DEFAULT, sizeof(priv->pwm_duty));
+ 	hid_set_drvdata(hdev, priv);
+ 
+ 	ret = hid_hw_start(hdev, HID_CONNECT_DRIVER);
+-- 
+2.43.0

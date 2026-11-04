@@ -1,0 +1,3 @@
+BENCH_SUMMARY,results,2628,of,5330,generate,0,choice,2628,capped,0,tokens,2628,seconds,6637
+BENCH_VERIFY,OK
+BENCH_DONE,rc,0,runs/qwen38-bench/mmlu_redux_5shot-20261103T233754Z

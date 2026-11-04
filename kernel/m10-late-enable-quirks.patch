@@ -1,0 +1,59 @@
+--- a/drivers/pci/quirks.c	2026-11-04 12:33:49.517696350 +0100
++++ b/drivers/pci/quirks.c	2026-11-04 12:33:49.504979476 +0100
+@@ -3284,6 +3284,56 @@
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_HINT, 0x0020, quirk_hotplug_bridge);
+ 
+ /*
++ * The external PEX8748 used by the M10 test host does not advertise PCIe
++ * hotplug capability.  Devices connected after boot consequently receive no
++ * spare bus numbers or bridge windows.  The motherboard PSU powers the M10 on
++ * external port 08.  The secondary PSU can power seven late M10s on ports
++ * 09-13; reserve every remaining branch of the eight-port deployment.
++ */
++static void quirk_pex8748_reserve_downstream(struct pci_dev *dev)
++{
++	if (!pci_is_pcie(dev) ||
++	    pci_pcie_type(dev) != PCI_EXP_TYPE_DOWNSTREAM ||
++	    PCI_SLOT(dev->devfn) < 0x09 ||
++	    PCI_SLOT(dev->devfn) > 0x13)
++		return;
++
++	dev->is_hotplug_bridge = 1;
++	pci_info(dev, "reserving resources for late M10 enumeration\n");
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_PLX, 0x8748,
++			 quirk_pex8748_reserve_downstream);
++
++/*
++ * GM107GL exposes a 128-byte port-I/O BAR at BAR5.  A four-GPU M10 consumes
++ * four 4 KiB bridge I/O windows for those BARs.  The M10 deployment uses the
++ * memory BARs exclusively, and a live CUDA validation showed that NVIDIA
++ * 580.178.04 remains functional with I/O decoding disabled.
++ *
++ * Suppress only BAR5 before resource sizing and leave BAR0/BAR1/BAR3 intact.
++ * Clear PCI_COMMAND_IO as well so a firmware-programmed BAR5 value cannot
++ * decode an untracked or shared port range.
++ */
++static void quirk_nvidia_gm107_m10_no_io_bar(struct pci_dev *dev)
++{
++	struct resource *io = &dev->resource[5];
++	u16 command;
++
++	if (!(io->flags & IORESOURCE_IO))
++		return;
++
++	pci_info(dev, "suppressing unused BAR5 port-I/O resource %pR\n", io);
++	memset(io, 0, sizeof(*io));
++
++	pci_read_config_word(dev, PCI_COMMAND, &command);
++	if (command & PCI_COMMAND_IO)
++		pci_write_config_word(dev, PCI_COMMAND,
++				      command & ~PCI_COMMAND_IO);
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_NVIDIA, 0x13bd,
++			 quirk_nvidia_gm107_m10_no_io_bar);
++
++/*
+  * This is a quirk for the Ricoh MMC controller found as a part of some
+  * multifunction chips.
+  *

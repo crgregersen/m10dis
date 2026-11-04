@@ -1,0 +1,820 @@
+{
+ "experiment": "batched MoE exchange research measurements",
+ "runs": [
+  {
+   "label": "m10_host_read_bw_20261103_h1",
+   "what": "concurrent pinned-host-memory read bandwidth from 1 / 4 (one card) / 6 (one per card) / 24 M10 GPUs, same 8 MiB buffer, volatile 16-B loads",
+   "goal": "host-staged batched-MoE request fan-out cost",
+   "runner": "src/run_qwen38_m10_host_read_bw.sh",
+   "status": "success",
+   "pueue_task": 89,
+   "result": "Same 8 MiB pinned host buffer, volatile reads: 1 GPU 3.2 GB/s; one card (4 GPUs) 3.35 GB/s total (0.84 each); one GPU per card (6) 11.7-12.0 GB/s total; all 24 GPUs 9.4-10.0 GB/s total (0.4 each)."
+  },
+  {
+   "label": "q38_moe_batch_test_20261103_b1",
+   "what": "offline hardware test of worker mode 8 vs mode 1 on M10 card 0 (routed, leader+3 peers) and card 5 (shared), random weights, R=1/17/64, bad-id rejection",
+   "goal": "batch outputs bit-identical to mode 1 in the mode-1 summation orders; acks/flags",
+   "runner": "src/run_q38_moe_batch_test.sh",
+   "status": "failed",
+   "pueue_task": 90,
+   "result": "routed+shared: all outputs bit-identical to mode 1 (R=1/17/64, up to 655,360 values per GPU), invalid requests rejected (16384 / 8192); routed ack check raced (test read the slot before its ack). Test now waits on the slot seq."
+  },
+  {
+   "label": "q38_moe_batch_test_20261103_b2",
+   "what": "b1 with the slot-ack wait",
+   "goal": "all checks OK",
+   "runner": "src/run_q38_moe_batch_test.sh",
+   "status": "done",
+   "pueue_task": 91
+  },
+  {
+   "label": "q38_moe_batch_test_batcharea_20261103_b3",
+   "pueue_task": 92,
+   "what": "offline mode-8 vs mode-1 test after moving the batch-area pointer into its own control field (batch_area)",
+   "status": "success",
+   "result": "Q38_MOE_BATCH_TESTS_PASSED 2 of 2: routed card 0 and shared card 5 bit-identical to mode 1 for R=1/17/64 (0 mismatches; 10240/174080/655360 values); invalid requests exit 16384 (routed) / 8192 (shared)",
+   "run_dir": "runs/batched-moe-research/moe-batch-test-20261103T105822Z"
+  },
+  {
+   "label": "uvm_swap_reap_lifecycle_postreboot_20261103_s2",
+   "pueue_task": 94,
+   "status": "success",
+   "result": "loaded 38263E1067A39300ABB966D sha 06e873a4...; s1 (task 93) refused: nvtop held device nodes, nothing changed"
+  },
+  {
+   "label": "M10_full_daemon_start_moe_batch_20261103_r7",
+   "pueue_task": 95,
+   "status": "success",
+   "what": "daemon start from source (services + cubins with mode 8 / batch_area)",
+   "result": "READY 11:09:17 UTC, 3 m 50 s"
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_20261103_i1",
+   "pueue_task": 96,
+   "after": 95,
+   "status": "failed",
+   "what": "per-row vs batched MoE, chunk 64, ~4k prompt, 32 tokens; expect identical token ids",
+   "result": "batch=0 PASS (4097 prompt tokens, 36.03 s, sha eb7d0aab4915); batch=1 failed at vLLM dummy run: reason 4 layer 0 worker 0 exit 0x2000 (8192, mode-8 config): batch_area was 0 because the services skip control writes when the mailbox loads while workers are parked. Cleanup checks all OK."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_batcharea_20261103_i2",
+   "pueue_task": 97,
+   "status": "failed",
+   "what": "i1 with the fix: peer library writes batch_area per worker at configure (saved, readback verified, restored at close)",
+   "result": "batch=0 PASS (36.63 s, sha eb7d0aab4915, same tokens as i1); batch=1: batch_area written and verified on 24 workers, still exit 0x2000 on worker 0. Observed (read-only BAR1 read, worker 0 after close): batch_scratch 0x0, batch_scratch_bytes 0. Cause: CPU-driven INFER (daemon warm-up) copies the whole control struct over multicast except the 4 mailbox words, zeroing the appended batch fields. After: routed workers seq 405082 status 1, shared workers seq 405083 mode 2 (took the park request). Restore of batch_area matched 24/24."
+  },
+  {
+   "label": "uvm_swap_reap_lifecycle_postreboot2_20261103_s3",
+   "pueue_task": 98,
+   "status": "success",
+   "result": "after reboot (cable unplug crash, boot 12:28:45): 38263E loaded 12:32:20"
+  },
+  {
+   "label": "M10_full_daemon_start_payloadfix_20261103_r8",
+   "pueue_task": 99,
+   "status": "success",
+   "what": "daemon start with services that copy only request fields in CPU-driven INFER + batch_area at parked mailbox load",
+   "result": "READY 11:36:24 UTC, 3 m 49 s"
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_payloadfix_20261103_i3",
+   "pueue_task": 100,
+   "after": 99,
+   "status": "success",
+   "what": "per-row vs batched MoE, chunk 64; expect identical token ids",
+   "run_dir": "runs/batched-moe-research/integration-20261103T113625Z",
+   "result": "tokens identical (sha eb7d0aab4915 both). per-row: 36.18 s, prefill est 35.49 s = 115.4 tok/s. batched: 47.02 s, prefill est 46.33 s = 88.4 tok/s, 3216 batch calls / 199,776 rows. All 8 post-run checks OK in both. Batched is 30% slower at chunk 64: not yet explained (needs exchange timing)."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_20261103_t1",
+   "pueue_task": 101,
+   "status": "success",
+   "what": "MoE exchange alone after generation: batched vs per row, R=1/8/16/32/64, 48 layers per pass, RTX ring + M10 worker stamps",
+   "run_dir": "runs/batched-moe-research/timing-20261103T114328Z",
+   "result": "ms per layer call batch/per-row: R1 0.451/0.175, R8 2.103/1.397, R16 3.936/2.703, R32 7.598/5.457, R64 14.749/10.782 (batch 0.39-0.73x). Bit-identical at all R. R64 batch: RTX publish 206 us, wait 10818, combine 3761; workers stage+gate_up 6204, down 2017, finish leader 2420, shared 4303, critical 10796. Per-row exchange 166 us (wait 126, combine 8). All 8 checks OK."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_mode1workers_20261103_t2",
+   "pueue_task": 102,
+   "status": "success",
+   "what": "t1 + M10 worker stamps on the per-row (mode 1) path (first floor(480/R) layers in the stamped pass)",
+   "run_dir": "runs/batched-moe-research/timing-20261103T114905Z",
+   "result": "mode 1 M10 per row (median, all R): validate 7.2, gate_up 38.9, down 22.5, finish leader 32.8 / peer 14.3, shared busy 69.6, critical 105.5 us; RTX wait 130, total 169. Mode 8 per row at R64: gate_up+stage 95.8, down 31.5, finish leader 37.1, shared 66.5, critical 166.8. Wall ms per layer call batch/per-row R64 14.739/10.786. Bit-identical at all R. All 8 checks OK."
+  },
+  {
+   "label": "pci_cluster_lm_topk_test_sharedxs_20261103_l2",
+   "pueue_task": 103,
+   "status": "success",
+   "result": "4 of 4 runs PASS, memcheck 0 errors (mode 7 now uses the shared kernel's q38_xs)"
+  },
+  {
+   "label": "M10_daemon_stop_for_offline_test_20261103_x1",
+   "pueue_task": 104,
+   "status": "success",
+   "what": "ordered daemon stop (operator standing OK 2026-11-03) for the offline M10 test",
+   "result": "Ordered stop completed; STOP_ONLY_DONE."
+  },
+  {
+   "label": "q38_moe_batch_test_sharedv2_20261103_b4",
+   "pueue_task": 105,
+   "after": 104,
+   "status": "success",
+   "what": "offline mode 8 vs mode 1 with shared expert-major v2 + request timing",
+   "result": "PASS 2 of 2. Bit-identical at R=1/17/64 (0 mismatches); invalid requests rejected (16384 routed, 8192 shared). Offline shared_v2 batch per row: 767.4 / 96.8 / 71.5 us at R=1/17/64 vs mode 1 at about 490 us per row (offline timing includes the host launch path)."
+  },
+  {
+   "label": "M10_full_daemon_start_sharedbatch_20261103_r9",
+   "pueue_task": 106,
+   "after": 104,
+   "status": "success",
+   "what": "daemon start: shared service with mode-8 scratch",
+   "result": "Daemon started with the shared service carrying mode-8 scratch; start took 3 m 49 s."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_sharedv2_20261103_t3",
+   "pueue_task": 107,
+   "after": 106,
+   "status": "success",
+   "what": "timing breakdown after shared v2",
+   "result": "Identical outputs at every R. R=64: batch 14.80 ms vs per row 10.82 ms per layer call (0.73x). shared_busy 3462 us (t2: 4303 us), critical 10944 us; routed stage+gate_up 6332 us is the critical path. Folder timing-20261103T120331Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_gateup_tiles_20261103_k1",
+   "what": "park + RELOAD_KERNELS with routed v3 carrying v2 step 2 (mode-8 gate/up: per (expert, 2 entries) units, x rows in shared memory, one FP8 decode for both rows; one 2*H shared x buffer for mode 1 / LM / mode 8; t_checked after host x staging)",
+   "goal": "swap kernels without a daemon restart; build 120 regs, 23476 B smem, 0 spills",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 108,
+   "result": "Reload generation 2, routed sha b4b76743...; daemon READY, PARKED, 48 layers; no restart. Folder pci-cluster-exchange/kernel-reload-20261103T130930Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_gateup_tiles_20261103_t4",
+   "what": "timing breakdown R=1..64 after v2 step 2; batch vs per-row bit identity",
+   "goal": "routed gate_up per row down from ~99 us; split of host staging vs gate/up",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 109,
+   "result": "Identical at every R. R=64: batch 13.29 ms vs per row 10.81 (0.81x; t3 0.73x). check+stage 3512 us, gate_up 1827 us (28.5/row; mode 1 39), down 1412, finish leader 2529, shared 3471, critical 9371, RTX combine 3979. R=1 check+stage 166 us (mode 1 validate 7): serial list builder. Folder timing-20261103T130935Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_stage_smem_20261103_k2",
+   "what": "RELOAD_KERNELS with mode-8 stage v2: block 0 copies ids/routes host->shared memory in parallel, list build from shared memory",
+   "goal": "remove the serial host/global reads of the list builder",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 110,
+   "result": "Reload generation 3, routed sha 315dec51...; no restart. Folder kernel-reload-20261103T131241Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_stage_smem_20261103_t5",
+   "what": "timing breakdown R=1..64 after stage v2",
+   "goal": "check+stage near the host x read floor (~1.6 ms at R=64), bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 111,
+   "result": "Identical at every R. R=64: batch 11.34 ms vs per row 10.76 (0.95x). check+stage 3512->1681 us (R=1: 166->62.5), gate_up 1826, down 1412, finish leader 2559, peer 1631, shared 3522, critical 7643, RTX combine 3820. Folder timing-20261103T131245Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_no_leader_reduce_20261103_k3",
+   "what": "RELOAD_KERNELS: mode 8 without the card-leader reduce (every routed worker writes its own rows); replaces plan step 3 (an on-card push window for 64 rows would need ~2400 more remapped PTEs, above UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE=512, which stays unchanged)",
+   "goal": "remove the leader's host read-back",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 112,
+   "result": "Reload OK, no restart. Folder kernel-reload-20261103T131820Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_rtx_reduce_20261103_t6",
+   "what": "timing R=1..64 with the peer library's multi-block q38_batch_combine (rows x 10 blocks) adding the 20 routed parts in the mode-1 card order ((own+p1)+p2)+p3",
+   "goal": "bit identity; finish ~ peer time; RTX combine well below 3.8 ms",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 113,
+   "result": "Identical at every R but slower: R=64 batch 12.97 ms vs per row 10.76 (0.83x). M10 critical 6987 us (finish 1960 for all), RTX combine 5802 us: 21 parts = 13.8 MB through the RTX Gen3 x4 link (~2.4 GB/s). Conclusion: the card reduce is needed; it must not go through host memory. Folder timing-20261103T131824Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_card_stream_reduce_20261103_k4",
+   "what": "RELOAD_KERNELS: mode-8 on-card reduce streamed row by row through the existing mode-1 aggregation windows (peer P2P write + token at +H*4+4, leader credit in the peer's host flag page word 16); no PTE added or changed",
+   "goal": "leader finish well below 2.5 ms; 6 parts to the RTX",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 114,
+   "result": "Reload OK, no restart. Folder kernel-reload-20261103T132408Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_card_stream_20261103_t7",
+   "what": "timing R=1..64; peer library combine reads the 6 reducer areas with float4 __ldcv over rows x 3 blocks",
+   "goal": "bit identity; RTX combine near 3.9 MB / 3.5 GB/s ~ 1.1 ms at R=64",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 115,
+   "result": "Identical at every R. Batch vs per row ms: R=1 0.333/0.259, R=8 1.304/1.351 (1.04x), R=16 2.309/2.697 (1.17x), R=32 4.478/5.459 (1.22x), R=64 8.073/10.767 (1.33x). R=64 us: check+stage 1621, gate_up 1813, down 1437, finish leader 1298 / peer 1300 (streamed on-card reduce, ~20 us per row), shared 3434, critical 6240, RTX combine 1591. Folder timing-20261103T132412Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_chunk1024_reuse_20261103_i4",
+   "what": "real ~4k-token prompt, vLLM max_batched_tokens 1024, per-row vs batched (64-row M10 chunks), 32 tokens; adapter dumps router ids of every batched call to runs/batched-moe-research/reuse-ids-20261103-i4",
+   "goal": "identical tokens; end-to-end prefill after v2 steps 1-3; real-routing expert reuse for chunk/grouping simulations",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 116,
+   "result": "Tokens identical (sha eb7d0aab4915, same as i3). 4097-token prompt, vLLM steps of 1024: per row 35.23 s (prefill 118.6 tok/s), batched 25.57 s (164.7 tok/s, 1.39x); 3984 batched calls, 245904 rows. Router ids dumped (336 calls). Real-routing reuse (warm-up/padding blocks excluded, 240 calls): in order chunk 64 3.65, 128 5.13, 256 7.82, 512 12.77 rows per expert (random routing chunk 64: 1.75); greedy grouping chunk 64 5.48, 128 7.28; sort heuristics 3.67-3.92."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_real_ids_20261103_t8",
+   "what": "timing R=1..64 with real router ids (layer 12 call c108 of i4, first R rows) instead of random experts",
+   "goal": "phase times at real reuse (3.65 at R=64) to decide on bigger chunks vs transport work",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 117,
+   "result": "Identical at every R. Real ids (L12_c108): R=64 batch 7.769 ms vs per row 10.728 (1.38x; random ids 1.33x). R=64 us: check+stage 1724, gate_up 1632 (random 1813), down 1144 (random 1437), finish 1305, shared 3539, critical 5887, combine 1594. Fit over t7+t8: gate_up = 18 + 1.2*distinct + 2.1*entries, down = 18 + 1.75*distinct + 1.2*entries (us; entries = R*10): per-entry work 33.5 us per row dominates weight reads. Simulated full-step chunks (real routing): 64 118 us/row (1.42x), 256 113 (1.48x), 1024 110 (1.52x)."
+  },
+  {
+   "label": "q38_kernel_reload_routed_fp8_fast_decode_20261103_k5",
+   "what": "RELOAD_KERNELS: mode-8 FP8 decode amortization: bit-identical 4-instruction E4M3 decode (bits to FP32 position * 2^120, exhaustively checked on 256 bytes; needs FP32 subnormals, plain -O2 build) in gate/up; down decodes each weight once per group of up to 4 entries (Q38_DOWN_GROUP=4). 128 registers (2 blocks/SM exactly), 23476 B smem, 0 spills",
+   "goal": "per-entry cost below 3.35 us",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 118,
+   "result": "Reload OK (128 regs accepted by the occupancy check). Folder kernel-reload-20261103T135521Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_fp8_fast_real_ids_20261103_t9",
+   "what": "timing R=1..64 with the real ids of t8 (L12_c108)",
+   "goal": "compare gate_up / down with t8 (1632 / 1144 us at R=64); bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 119,
+   "result": "Identical at every R. Real ids R=64: batch 7.27 ms vs per row 10.79 (1.48x; t8 1.38x). gate_up 1632->1466, down 1144->959, check+stage 1593, finish 1306, shared 3401, critical 5402, combine 1587. gate/up streams 388 units x 164 KB = 63.6 MB in 1.47 ms (~43 GB/s): weight-read bound, not decode bound. Folder timing-20261103T135525Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_gateup_contiguous_20261103_k6",
+   "what": "RELOAD_KERNELS: mode-8 gate/up units assigned to blocks in contiguous ranges (an expert's pairs back to back on one SM) instead of strided",
+   "goal": "L2 hits for the 2nd..nth pair of an expert",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 120,
+   "result": "Reload OK. Folder kernel-reload-20261103T135806Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_gateup_contiguous_20261103_t10",
+   "what": "timing with the real ids of t8/t9",
+   "goal": "gate_up below 1466 us at R=64; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 121,
+   "result": "Identical. Contiguous unit ranges did not help: R=64 gate_up 1503 us (strided 1466), batch 7.49 ms (1.44x). Reverted to strided. Folder timing-20261103T135811Z."
+  },
+  {
+   "label": "q38_kernel_reload_routed_bf16_tiles_20261103_k7",
+   "what": "RELOAD_KERNELS: mode-8 gate/up with 4-row BF16 x tiles when every staged x value is exactly BF16 (stage check, per-request marker; else the 2-row FP32 tiles); strided units restored; 128 regs, 0 spills",
+   "goal": "gate/up weight reads 0.67x of the 2-row tiles",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 122,
+   "result": "Reload OK. Folder kernel-reload-20261103T140318Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_bf16_tiles_20261103_t11",
+   "what": "timing with the real ids of t8-t10 (BF16 hidden states, so the 4-row path)",
+   "goal": "gate_up well below 1466 us at R=64; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 123,
+   "result": "Identical at every R. Real ids R=64: batch 6.921 ms vs per row 10.72 (1.55x). gate_up 1466->1114 us (-24%; weight units 0.67x), down 957, check+stage 1618, finish 1323, shared 3461, critical 5083, combine 1586. R=1 gate_up 35->47 (4-row compute for single rows; single rows use mode 1 in vLLM, min_rows 2). Folder timing-20261103T140323Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_chunk1024_bf16_20261103_i5",
+   "what": "real ~4k-token prompt, vLLM steps of 1024, per row vs batched with all v2 kernels (stage v2, on-card streamed reduce, multi-block combine, fast FP8 decode, grouped down, 4-row BF16 gate/up tiles)",
+   "goal": "identical tokens (sha eb7d0aab4915); end-to-end prefill vs i4 (164.7 tok/s)",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 124,
+   "result": "Tokens identical (sha eb7d0aab4915). 4097-token prompt, steps of 1024: per row 35.21 s (prefill 118.7 tok/s), batched 23.15 s (182.4 tok/s, 1.54x; i4 164.7). Folder integration-20261103T140525Z."
+  },
+  {
+   "label": "q38_kernel_reload_bf16_request_x_20261103_k8",
+   "what": "RELOAD_KERNELS (routed + shared): mode-8 request x as raw BF16 when the RTX hidden states are BF16 (Q38_BATCH_REQ_FMT word; workers widen exactly), halving the 24 workers' host reads. Chosen before PEX multicast: the RTX writes each multicast row 6 times (kPexGroups=6) over its Gen3 x4 link, so BF16 multicast ~8.6 us/row vs BF16 host ~10 us/row",
+   "goal": "check+stage ~halved (1618 us at R=64)",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 125,
+   "result": "Reload OK. Folder kernel-reload-20261103T141912Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_bf16_request_20261103_t12",
+   "what": "timing with real ids (L12_c108); peer library publishes BF16 request rows",
+   "goal": "bit identity vs mode 1 (FP32 publish); stage time",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 126,
+   "result": "Identical at every R (BF16 request vs mode-1 FP32). Real ids R=64: batch 6.537 ms vs per row 10.70 (1.64x). check+stage 1618->1324 us only (-18%): 24 x 327 KB in ~1.26 ms = ~6 GB/s aggregate (FP32 ran at ~10 GB/s): latency bound (one 4-byte volatile load per thread). gate_up 1106, down 953, finish 1332, shared 3187, critical 4777, combine 1590. Folder timing-20261103T141917Z."
+  },
+  {
+   "label": "q38_kernel_reload_stage_ldcv128_20261103_k9",
+   "what": "RELOAD_KERNELS: q38_batch_stage_x with 16-byte __ldcv loads, 4 in flight per thread (routed 128 regs, shared 116 regs, 0 spills)",
+   "goal": "host fan-out back at the ~10 GB/s limit: stage ~0.85 ms at R=64",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 127,
+   "result": "Reload OK. Folder kernel-reload-20261103T142202Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_stage_ldcv128_20261103_t13",
+   "what": "timing with real ids (L12_c108)",
+   "goal": "stage time; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 128,
+   "result": "Identical. No gain from 16-byte __ldcv x4: R=64 check+stage 1394 us (t12 1324), batch 6.791 ms (1.59x); gate_up 1223 vs 1106 in t12 with unchanged code: run-to-run noise ~5-10%. R=1 check+stage 126 us in t12 and t13 (t11 67) and shared busy 166 (98): every thread read the format word from host. Folder timing-20261103T142207Z."
+  },
+  {
+   "label": "q38_kernel_reload_fmt_once_per_block_20261103_k10",
+   "what": "RELOAD_KERNELS: request format word read once per block (shared memory) instead of by every thread",
+   "goal": "R=1 check+stage back to ~63 us; shared busy ~98 us",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 129,
+   "result": "Reload OK."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_fmt_once_20261103_t14",
+   "what": "timing with real ids (L12_c108)",
+   "goal": "fixed stage overhead gone; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 130,
+   "result": "Identical at every R. Format word once per block fixed the small-R overhead: R=1 check+stage 63.5 us (126), shared busy 98 (166). R=64: batch 6.532 ms vs per row 10.738 (1.64x); check+stage 1193, gate_up 1219, down 962, finish 1314, shared 3024, critical 4744, combine 1587. Note: client/adapter sources were edited at 15:26:31 while this task ran (15:25:01-15:26:36); its client log ends 15:26:28 and the run-folder copies equal the pre-edit files, so the run is unaffected. Folder timing-20261103T142501Z."
+  },
+  {
+   "label": "q38_kernel_reload_stage_stamps_20261103_k11",
+   "what": "RELOAD_KERNELS: routed mode 8 writes t_extra in its worker timing record (high 32 bits validation end - t_seen, low 32 bits block 0's list build, ns); the peer library now copies t_extra (was t_unused = 0); adapter passes it on",
+   "goal": "split check+stage into validation, host x copy, list build",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 131,
+   "result": "Reload OK. Folder kernel-reload-20261103T142800Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_stage_stamps_20261103_t15",
+   "what": "timing with real ids; new fields routed_validate8 / routed_stage8 / routed_lists8",
+   "goal": "attribute the ~1.2 ms check+stage at R=64",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 132,
+   "result": "Identical at every R. R=64 (real ids): batch 6.645 ms vs per row 10.728 (1.61x). check+stage 1232 us = validation 15 + stage 1217, of which block 0's list build 140 (R=1: 35 of a 56 us stage; R=8 48, R=16 60, R=32 87). Host x copy ~1.08 ms for 24 x 327 KB = ~7.3 GB/s aggregate, ~73% of the measured 24-GPU fan-out limit (9.4-10 GB/s). Folder timing-20261103T142805Z."
+  },
+  {
+   "label": "q38_kernel_reload_parallel_lists_20261103_k12",
+   "what": "RELOAD_KERNELS: block-parallel list build (shared-memory atomic counts, one block scan over the 512 experts for offsets / distinct index / 2- and 4-row unit prefixes, atomic entry placement), block 0 builds lists before its x share; routed kernel now __launch_bounds__(256, 2) (without it ptxas chose 168 registers); 128 regs, 0 spills",
+   "goal": "list build ~140 -> ~15 us at R=64, ~35 -> few us at R=1",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 133,
+   "result": "Reload OK (launch bounds, 128 regs). Folder kernel-reload-20261103T143603Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_parallel_lists_20261103_t16",
+   "what": "timing with real ids (L12_c108)",
+   "goal": "routed_lists8 and stage; bit identity (entry order inside an expert is no longer fixed)",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 134,
+   "result": "Identical at every R. List build 140 -> 5 us at R=64 (R=1 35 -> 4). Stage after validation: R=1 25 us (56), R=8 97 (150), R=64 1109 (1217). Batch vs per row: R=8 0.982/1.344 ms (1.37x), R=16 1.60x, R=32 1.62x, R=64 6.558/10.711 (1.63x). R=64: gate_up 1220, down 969, finish 1353, shared 3144, critical 4753, combine 1592. Folder timing-20261103T143608Z."
+  },
+  {
+   "label": "q38_kernel_reload_mode1_bf16_fastfp8_20261103_k13",
+   "what": "RELOAD_KERNELS: mode 1 (single-row decode path) gets (a) BF16 x over PEX multicast when the RTX hidden states are BF16 (control->reserved = 1; x[] holds H/2 packed words; routed + shared widen exactly; the older publisher and CPU-driven requests write 0 = FP32) and (b) the fast bit-identical FP8 decode in gate/up (q38_fp8dot16) and down. routed 128 regs, shared 127, 0 spills",
+   "goal": "mode-1 RTX publish 26.6 -> ~13 us; gate/up 39 / down 22.5 us lower",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 135,
+   "result": "Reload OK. Folder kernel-reload-20261103T144128Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_mode1_bf16_20261103_t17",
+   "what": "timing with real ids; compare the per_row (mode 1) phases with t16",
+   "goal": "per-row publish, wait, worker gate_up/down/critical; batch vs per-row identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 136,
+   "result": "Identical at every R. Mode 1 per row: RTX publish 26.6 -> 16.4 us (BF16 multicast), gate/up 37.9 -> 34.8, but down 22.5 -> 32.8 (fast decode slower in this latency-bound loop), critical 103 -> 113, RTX total per exchange 167.9 -> 165.9. Batched R=64: 6.426 vs 10.579 ms (1.65x). Folder timing-20261103T*."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_mode1_bf16_20261103_i6",
+   "what": "real ~4k-token prompt, steps of 1024, per row (all mode 1) vs batched, 32 tokens",
+   "goal": "tokens identical to sha eb7d0aab4915 for both (end-to-end check of mode-1 BF16 + fast decode); per-row and batched elapsed",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 137,
+   "result": "Tokens identical (sha eb7d0aab4915) in both runs. Per row (mode 1) 34.88 s (prefill 119.8 tok/s; i5 35.21), batched 21.47 s (prefill 197.1 tok/s; i5 182.4). Folder integration-20261103T144308Z."
+  },
+  {
+   "label": "q38_kernel_reload_mode1_down_orig_decode_20261103_k14",
+   "what": "RELOAD_KERNELS: mode-1 down back to the original fp8e4m3 decode (keeps BF16 mode-1 x and the fast decode in mode-1 gate/up)",
+   "goal": "mode-1 down back to ~22.5 us; RTX total per exchange ~155 us",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 138,
+   "result": "Reload OK. Folder kernel-reload-20261103T144759Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_mode1_down_orig_20261103_t18",
+   "what": "timing with real ids; per-row (mode 1) phases",
+   "goal": "compare with t16/t17",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 139,
+   "result": "Identical at every R. Mode 1 per row (decode path): RTX publish 16.4 us (t16 26.6), gate/up 31.7 (37.9), down 22.5 (22.5), critical 97.3 (103.4), RTX total per exchange 151.6 (167.9): -10%. Per-row layer call at R=64 10.71 -> 9.66 ms. Batched R=64 6.506 ms (1.49x vs the faster per-row path). Folder timing-20261103T144804Z."
+  },
+  {
+   "label": "M10_vllm_decode_mode1_bf16_20261103_d1",
+   "what": "decode benchmark: default 265-token prompt, 256 new tokens, 2 repeats, integration settings (QSA FP8 cache, CUDA graphs, GPU-driven, M10 LM head), all kernels as of k14",
+   "goal": "absolute decode tok/s after the mode-1 changes (MoE exchange 168 -> 152 us per layer)",
+   "runner": "src/run_qwen38_rtx_peer_vllm.sh",
+   "status": "success",
+   "pueue_task": 140,
+   "result": "All run checks pass. 265-token prompt, 247 tokens (EOS) per repeat: 6.20 / 6.15 s = 39.8 / 40.2 tok/s incl prefill; one 10-s progress window 44.4 tok/s (includes a prefill). Not comparable to earlier runs (settings differ: 1024-token steps + batched prefill); tokens diverge from the Oct-31 reference at 51 (03:10 HumanEval run: 64). Folder qwen38-vllm-rtx-peer-optimized/20261103T145115Z."
+  },
+  {
+   "label": "M10_vllm_decode_ab_vs_0246_20261103_d2",
+   "what": "decode A/B: exact settings of 20261103T024620Z (before today's work; non-QSA cache, graph ceiling/breakdown 50, 2 repeats, default steps, no batched MoE), all kernels as of k14",
+   "goal": "generated token ids identical to 024620Z (334 tokens per repeat); decode tok/s windows vs 46.5-47",
+   "runner": "src/run_qwen38_rtx_peer_vllm.sh",
+   "status": "success",
+   "pueue_task": 141,
+   "result": "All run checks pass. Not an exact rerun of task 82 (that command also set MAX_MODEL_LEN=640, MAX_NEW_TOKENS=370, PROGRESS_SECONDS=2; not recorded in its settings): default 220 tokens per repeat. The 220 tokens equal the first 220 of 20261103T024620Z in both repeats (decode path bit-exact). Elapsed 15.02 / 10.80 s; 10-s progress windows, no clean decode rate. Folder 20261103T145404Z."
+  },
+  {
+   "label": "M10_vllm_decode_ab_vs_r27_20261103_d3",
+   "what": "decode A/B: exact command of task 81 (r27, folder 20261103T024118Z, before today's work): 265-token prompt, 370 max new tokens, 2 repeats, progress every 2 s; all kernels as of k14",
+   "goal": "token ids identical to 024118Z; steady decode tok/s windows vs r27",
+   "runner": "src/run_qwen38_rtx_peer_vllm.sh",
+   "status": "success",
+   "pueue_task": 142,
+   "result": "All run checks pass. Exact rerun of task 81 (r27, 20261103T024118Z): generated token ids identical in both repeats (334 tokens). Steady 2-s decode windows 48.0-48.5 tok/s (r27: 46.0-46.5), +4%, matching the mode-1 MoE exchange saving (168 -> 152 us per layer). Elapsed 14.84 / 16.05 s (r27 15.87 / 14.27; dominated by the 8-token-step prefill). Folder 20261103T145707Z."
+  },
+  {
+   "label": "q38_kernel_reload_shared_bf16_tiles_20261103_k15",
+   "what": "RELOAD_KERNELS: shared expert mode 8 with 4-row BF16-x tiles for BF16 requests (gate/up weights read once per 4 rows; gate dot with a BF16-x variant; FP32 requests keep 2-row tiles); shared kernel __launch_bounds__(256, 2): 120 regs, 0 spills. Client reports shared_stage8 / hidden8 / down8 / finish8",
+   "goal": "shared hidden phase ~halved; shared busy well below the routed critical path",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 143,
+   "result": "Reload OK. Folder kernel-reload-20261103T145943Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_shared_tiles_20261103_t19",
+   "what": "timing with real ids (L12_c108)",
+   "goal": "shared phases; bit identity vs mode 1",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 144,
+   "result": "Identical at every R. Shared expert R=64: busy 2839 us (t16 3144): stage 876, hidden 370, down+part copy+card reduce via host 1562, finish 2. Not on the critical path (routed critical 4632). Batched R=64 6.378 ms vs per row 9.654 (1.51x); R=8 1.24x, R=16 1.41x. Folder timing-20261103T145949Z."
+  },
+  {
+   "label": "q38_kernel_reload_pipe_mode9_20261103_k16",
+   "what": "RELOAD_KERNELS: worker mode 9 (pipelined batched MoE): request in host slot seq&1 (two 32-row slots inside the mode-8 area; header {fmt, rows, layer, seq}); doorbell may lead by 2, worker takes last+1; card peers wait for the leader's last credit (window free for the next request). Mode 8 = slot 0, unchanged layout. Routed 128 regs with 16 B spill (per-request scalars, not in gate/up/down loops); shared 123 regs, 0 spills",
+   "goal": "reload OK, daemon READY parked",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 145,
+   "result": "Reload OK, daemon READY parked (pid 31992, generation 17). Folder kernel-reload-20261103T160901Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_pipe_20261103_t20",
+   "what": "timing with real ids (L12_c108), paths batch (mode 8, 64-row chunks, one enqueue each) / pipe (q38_rtx_peer_moe_batch_pipe_gpu: 32-row chunks, two in flight, combine c overlaps workers on c+1) / per_row, R = 32 64 128 256 1024",
+   "goal": "pipe bit-identical to batch and per row; pipe faster than batch from R >= 64 (estimate ~1.3x: per 32-row chunk the RTX publish+combine ~0.9 ms hides under the workers' ~2.35 ms)",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "failed",
+   "pueue_task": 146,
+   "result": "Did not start: pueue dropped the quotes around the space-separated env values, env exited 127 (\"pipe: No such file\"). No hardware access. Client now accepts commas; requeued as t20b."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_pipe_20261103_t20b",
+   "what": "t20 requeued with comma lists (paths batch,pipe,per_row; R 32,64,128,256,1024; real ids L12_c108)",
+   "goal": "as t20",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "failed",
+   "pueue_task": 147,
+   "result": "All 24 workers (routed + shared) failed the first pipelined request seq 1382087 (layer 0) with exit 0x2000 (Q38_BATCH_REASON_CONFIG); the batch path R=32 had passed. Cause: RTX slot = chunk & 1, worker slot = seq & 1; pipe_base 1382087 is odd, so the workers read the other slot header (seq mismatch). Runner checks all OK; daemon READY 48 PARKED pid 31992 afterwards. Fix: RTX derives slot = seq & 1 on the device (PciClusterMoeBatchOp::slot_of). Folder timing-20261103T160938Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_pipe_20261103_t20c",
+   "what": "t20b rerun with the RTX slot fix (slot = seq & 1 on the device); kernels unchanged (k16)",
+   "goal": "as t20",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 148,
+   "result": "Pipe vs batch (ms per layer call, real ids): R32 3.120 vs 3.105 (1.00x), R64 5.791 vs 6.159 (1.06x), R128 10.453 vs 12.175 (1.17x), R256 19.544 vs 24.538 (1.26x), R1024 72.696 vs 97.638 (1.34x); per row R1024 157.59. Pipe and per row bit-identical to batch at R 32-256 (diff 0.0). R1024 compare invalid (harness: stamped pass shortened to fit the worker ring, outputs were layers 29 / 14 / 47); fixed, rerun t20d. Pipe R1024: chunk period 2213 us = worker critical 2214 us (RTX publish/combine hidden); routed stage 212 us per 32 rows (batch 974 per 64). Folder timing-20261103T161411Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_pipe_R1024_20261103_t20d",
+   "what": "R=1024 only, paths batch,pipe,per_row, every shortened path recomputes layer 47",
+   "goal": "bit identity at R=1024",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 149,
+   "result": "R=1024: pipe 72.893, batch 98.403, per row 157.231 ms per layer call (pipe 1.35x batch); pipe and per row bit-identical to batch at layer 47 (diff 0.0). Folder timing-20261103T161759Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_pipe_20261103_i7",
+   "what": "real ~4k-token prompt, steps of 1024, batched (mode 8) vs pipelined (mode 9, Q38_RTX_PEER_MOE_BATCH_PIPE=1), 32 tokens; settings as i6",
+   "goal": "tokens identical to i6 sha eb7d0aab4915 in both; pipelined prefill faster than i6 197.1 tok/s (MoE alone 1.34x at R=1024 in t20c)",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 150,
+   "result": "Tokens identical (sha eb7d0aab4915, = i6) in both runs. Batched 20.69 s (prefill est 204.8 tok/s; i6 197.1), pipelined 15.65 s (prefill est 273.7 tok/s): 288 pipelined layer calls (6 steps x 48), 7776 worker exchanges. All runner checks OK. Folder integration-20261103T162032Z."
+  },
+  {
+   "label": "q38_kernel_reload_finish_local_sum_20261103_k17",
+   "what": "RELOAD_KERNELS: card leader sums each streamed row in place in device x_stage and grants the credit at once (credit fence orders only local writes); after the last row all 10 blocks copy the R sums to the host part area (float4). Same addition order. Routed 128 regs, 16 B spill (unchanged)",
+   "goal": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 151,
+   "result": "Reload OK."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_finish_20261103_t21",
+   "what": "timing, real ids, paths batch,pipe,per_row, R 32,64,1024",
+   "goal": "bit identity; routed_finish_leader per 32-row chunk well below t20c 727 us; pipe R=1024 below 72.9 ms",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 152,
+   "result": "Bit-identical (diff 0.0) batch / pipe / per row at R 32, 64, 1024. SLOWER finish: pipe R1024 leader finish 864 us per 32-row chunk (t20c 727), batch R64 1544 (t20c 1328); pipe R1024 74.206 ms (t20d 72.893), batch 101.2 (98.4). Folder timing-20261103T163938Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_finish_20261103_i8",
+   "what": "real ~4k prompt, steps of 1024, pipelined only (mode 2), settings as i7",
+   "goal": "tokens sha eb7d0aab4915; prefill above i7 273.7 tok/s",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "failed",
+   "pueue_task": 153,
+   "result": "TOKENS CHANGED: sha 1744d27ab3a0 (i7 pipe and batch eb7d0aab4915). Prompt identical; first 11 of 32 tokens equal, 21 differ; text still plausible code. Elapsed 15.97 s, prefill est 267.9 tok/s (i7 273.7). Runner checks OK. Open question: k17 bug/race or a mode-9 race present before (i7 one sample). Folder integration-20261103T164220Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_diag_k17_repeat_20261103_i9",
+   "what": "diagnostic: i8 repeated unchanged (k17 kernels, pipelined)",
+   "goal": "same sha 1744d27ab3a0 = deterministic; other sha = race",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 154,
+   "result": "k17 pipelined: sha eb7d0aab4915 (i8 same config gave 1744d27ab3a0) -> nondeterministic. 16.10 s, prefill est 265.8. Folder integration-20261103T170044Z."
+  },
+  {
+   "label": "q38_kernel_reload_revert_k16_20261103_k18",
+   "what": "RELOAD_KERNELS from k16 sources (k17 finish change reverted; source hashes verified equal to kernel-reload-20261103T160901Z)",
+   "goal": "reload OK, routed cubin hash = k16",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 155,
+   "result": "Reload OK; routed cubin sha 542866e428ef6e08 = k16. Folder kernel-reload-20261103T170226Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_diag_k16_pipe_x2_20261103_i10",
+   "what": "diagnostic: k16 kernels, pipelined twice in a row, settings as i7",
+   "goal": "both eb7d0aab4915 = k17 at fault; any other sha = race in mode 9",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 156,
+   "result": "k16 pipelined twice: run 1 eb7d0aab4915 (15.72 s, 272.5 tok/s), run 2 1744d27ab3a0 (15.67 s, 273.4). RACE IN MODE 9 (present since k16; i7 was one lucky sample); k17 not at fault for the tokens (only slower). The wrong outcome is always the same sha: a discrete event. Timing harness missed it (compares only layer 47). All runner checks OK. Folder integration-20261103T170231Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_stress_pipe_batch_R1024_20261103_t22",
+   "what": "stress identity: R=1024 real ids, input h + layer*2^-6 per layer, 20 passes x 48 layers for pipe and batch, every row checksum vs per-row (mode 1) reference; k16 kernels",
+   "goal": "locate the mode-9 race (pass/layer/chunk/row-in-chunk of bad rows); does mode 8 race too",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "failed",
+   "pueue_task": 157,
+   "result": "Harness bug before the stress loop: adapter output is BF16, checksum viewed it as int32 (1280 vs 2560 columns). Timing part ran (pipe R1024 72.685 ms). Runner checks OK. Fixed; rerun t22b. Folder timing-20261103T171457Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_stress_pipe_batch_R1024_20261103_t22b",
+   "what": "t22 rerun with the BF16 checksum fix",
+   "goal": "as t22",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 158,
+   "result": "Zero bad rows: pipe 20 passes x 48 layers x 1024 rows (960 layer calls, 30,720 chunks, 983,040 rows) and batch (960 calls, 15,360 exchanges) all bit-identical (BF16 output words, 64-bit row checksum) to the per-row mode-1 reference, input different per layer. No race found in the MoE exchange; the i8/i10 token flips (always the same alternative sha 1744d27ab3a0) are more likely RTX-side nondeterminism (e.g. autotune / split-K) - unproven. Pipe R1024 72.569 ms. Folder timing-20261103T171706Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_integration_force_first_config_20261103_i11",
+   "what": "VLLM_TRITON_FORCE_FIRST_CONFIG=1 (no Triton autotuning on the RTX); real ~4k prompt, steps of 1024, modes batch, pipe, batch, pipe; k16 kernels; settings as i7",
+   "goal": "all four runs the same token sha (RTX autotune = cause of the eb7d/1744 flips; new reference sha); pipelined prefill speed with fixed configs",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 159,
+   "result": "All four runs sha eb7d0aab4915 (setting recorded in each result.json). Batch 20.79 / 20.69 s (prefill est 203.8 / 204.8 tok/s), pipe 15.71 / 15.66 s (272.6 / 273.7 tok/s): no speed cost from skipping autotune. Consistent with RTX autotune as the cause of the flips, but only 2 pipelined samples (earlier flip rate 2 of 5): not yet conclusive. Runner checks OK. Folder integration-20261103T172831Z."
+  },
+  {
+   "label": "q38_uvm_swap_post_move_20261103",
+   "what": "post-reboot (rig moved) UVM swap stock 86D49 -> 38263E with m10-fancontrol stopped/restarted",
+   "runner": "runs/qwen38-uvm-swap/20261103T185008Z/run-swap-with-fancontrol.sh",
+   "status": "success",
+   "pueue_task": 160,
+   "result": "Loaded srcversion 38263E1067A39300ABB966D, sha 06e873a4...; journal load 2026-11-03T19:50:19+01:00; fancontrol active again. Daemon start record updated to this swap."
+  },
+  {
+   "label": "M10_full_daemon_start_post_move_20261103_r10",
+   "what": "fresh daemon start after the reboot",
+   "runner": "src/run_qwen38_full_daemon_start.sh",
+   "status": "success",
+   "pueue_task": 161,
+   "result": "READY 48 layers, workers PARKED, pid 25306; load 181.9 s (experts 138.5 s, PLE 52.5 GB in 36.2 s). Routed and shared cubins byte-identical to k16 (routed sha 542866e4..., shared 94a3df98...). Folder qwen38-full-daemon/20261103T185050Z."
+  },
+  {
+   "label": "M10_vllm_moe_pipe_repeats_force_first_config_20261103_i12",
+   "what": "10 pipelined end-to-end runs (mode 9, k16, chunk 1024) with VLLM_TRITON_FORCE_FIRST_CONFIG=1",
+   "goal": "settle whether Triton autotune causes the token flips",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 162,
+   "result": "Autotune hypothesis NOT confirmed: 6 of 10 eb7d0aab4915, 1 7f64b720f148, 1 0a82e6ed609e, 2 fd70937ed577 (runs 9 and 10). Every divergence is at generated token 6 (reference 13139; alternatives 2327, 85514, 9944): prompt identical, tokens 0-5 identical. i8/i10 alternative 1744d27ab3a0 diverged at token 11. Several different alternatives at one position suggest a near-tie at token 6 that small numeric differences flip; no logprobs recorded to show the margin. Prefill 272.9-275.0 tok/s, 15.58-15.70 s. All runner checks PASS. Folder integration-20261103T200649Z."
+  },
+  {
+   "label": "q38_kernel_reload_x_prefetch_20261103_k19",
+   "what": "RELOAD_KERNELS: mode-9 x prefetch (blocks 1..9 copy chunk seq+1's rows into the free upper half of the down-term scratch during block 0's finish, after the seq+1 doorbell; per-block tags; stage reads device memory on a full tag match)",
+   "goal": "remove the 212 us routed stage per 32-row chunk from the critical path",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 163,
+   "result": "Reload OK, generation 2, routed sha 428fb3b9...; daemon READY 48 PARKED pid 25306. Routed 128 regs, spill 4/8 B (k16 16 B). Sources backed up in source-backups-20261103/bak-prefetch (k16). Folder pci-cluster-exchange/kernel-reload-20261103T202655Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_x_prefetch_20261103_t23",
+   "what": "timing batch/pipe/per row at R 32/64/256/1024, real ids L12_c108",
+   "goal": "pipe chunk period below 2213 us; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 164,
+   "result": "Bit-identical at every R (pipe and per row vs batch). Prefetch hits: pipe routed stage 212 -> 41 us per chunk (check+stage 50). But leader finish 727 -> 918.5 us (peer 925): the host reads of the prefetch slow the latency-bound row handshake (credit polling in host memory). Net zero: critical 2210 us (t20c 2214), chunk period 2220 (2213); pipe ms per layer call R32 3.146, R64 5.472, R256 18.80, R1024 72.00 (t20d 72.89); batch R1024 96.17, per row 155.80. Shared stage 239.6 us (not prefetched). Folder timing-20261103T202701Z."
+  },
+  {
+   "label": "q38_kernel_reload_x_prefetch_down_20261103_k20",
+   "what": "RELOAD_KERNELS: mode-9 x prefetch moved into the down phase (each thread copies its 4 items inside the down expert loop, staggered by warp; copy only if the seq+1 doorbell is already there at down start, no waiting). Holding loads across down was rejected offline (kernel at 128-reg cap: loaded registers were spilled right after the host load)",
+   "goal": "stage gain of k19 without slowing the finish",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 165,
+   "result": "Reload OK, generation 3, routed sha 9b2b2dc9...; daemon READY 48 PARKED pid 25306. Spill 80/104 B (k16 16 B, k19 4/8 B). k19 sources in source-backups-20261103/bak-k19. Folder pci-cluster-exchange/kernel-reload-20261103T210955Z."
+  },
+  {
+   "label": "M10_vllm_moe_batch_timing_x_prefetch_down_20261103_t24",
+   "what": "timing batch/pipe/per row at R 32/64/256/1024, real ids L12_c108",
+   "goal": "pipe chunk period below 2213 us; bit identity",
+   "runner": "src/run_qwen38_moe_batch_timing.sh",
+   "status": "success",
+   "pueue_task": 166,
+   "result": "WORSE. Bit-identical at every R. Prefetch almost never hit: pipe routed stage 222 us (k16 212, k19 41), i.e. the seq+1 doorbell has not arrived by down start (~0.7 ms into the chunk; k19 hit at ~1.9 ms). The added code slowed every path through spills: pipe down 534 -> 633 us, batch R64-path down 982 -> 1207, mode 1 per row down 22.5 -> 42.0 us and critical 97.3 -> 117.8 us (decode path). Pipe R1024 76.05 ms (k19 72.00, k16 72.89), chunk period 2321 us; batch R1024 100.8, per row 176.3 (155.8). Leader finish 724 us (back to k16 level: no host traffic in finish). Folder timing-20261103T211001Z."
+  },
+  {
+   "label": "q38_kernel_reload_revert_k16_20261103_k21",
+   "what": "RELOAD_KERNELS: revert the x prefetch (k19/k20) to k16 sources (bak-prefetch = bak-finish hashes; layout = k18 reload copy)",
+   "goal": "validated k16 baseline back on the M10s (k20 slowed mode 1 decode)",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 167,
+   "result": "Reload OK, generation 4, routed sha 542866e428ef6e08 = k16 (byte-identical cubin); routed 128 regs, shared 123; daemon READY 48 PARKED pid 25306. k20 sources saved in source-backups-20261103/bak-k20, k19 in bak-k19. Folder pci-cluster-exchange/kernel-reload-20261103T211623Z."
+  },
+  {
+   "label": "M10_vllm_moe_pipe_repeats_logprobs_20261103_i13",
+   "what": "10 pipelined end-to-end runs (k16, chunk 1024, VLLM_TRITON_FORCE_FIRST_CONFIG=1) with Q38_VLLM_LOGPROBS=5 (top-5 per generated token; M10 LM head: normalized over the 24x1024 candidates, margins exact)",
+   "goal": "margin at generated token 6; does the numeric difference start in the prefill",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 168,
+   "result": "All 10 runs eb7d0aab4915 (no flip this time), but no two runs have identical logprobs. Token 0 (prefill only) top1-top2 margin 2.25-3.125 across runs: the prefill output already differs by up to ~0.9 logit (7 BF16 steps at 0.125). Token 6 margin 0.000-0.625 (runs 2 and 10: exact BF16 tie, 13139 won both; run 2 a three-way tie with 85514 and 47770); token 11 margin 0.375-1.25 (the earlier 1744d27ab3a0 flip position); all other positions >= 2.25. Chosen-token logprob spread at token 6 0.59. So the flips are near-ties exposed by a run-to-run variation of the prefill that is far larger than last-bit rounding. No atomics or scatter-add in our RTX code (adapter, hooks, rtx_peer.cu); the M10 exchange passed t22b. Prefill 264.8-272.9 tok/s (logprobs cost ~1%). Folder integration-20261103T212033Z."
+  },
+  {
+   "label": "M10_vllm_moe_perrow_repeats_logprobs_20261103_i14",
+   "what": "5 per-row end-to-end runs (mode 0, mode-1 MoE per row, k16, chunk 1024, VLLM_TRITON_FORCE_FIRST_CONFIG=1, Q38_VLLM_LOGPROBS=5)",
+   "goal": "per-row LM-head jitter floor vs the pipelined floor (i13)",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 169,
+   "result": "Per row jitters like pipelined: all 5 eb7d0aab4915, no two runs identical. Token-0 margin 2.5-3.375 (pipe 2.25-3.125), token 6 0.25-0.375, token 11 0.375-1.25. Floor (tools/lm_head_floor.py; per position with identical prefix, max |dlogprob| over shared top-5): per row max 2.29 / median 0.25; pipe (i13) 2.13 / 0.31; cross per-row x pipe max 2.25 / median 0.31 = within the floors. Conclusion: the batched/pipelined MoE adds no jitter of its own; the run-to-run variation is RTX-side (vLLM kernels, operator: attention). Prefill 130.5-130.8 tok/s per row (32.0 s). Folder integration-20261103T222931Z."
+  },
+  {
+   "label": "q38_hc_fp8_kernel_tests_20261103_u1_u3",
+   "what": "offline RTX tests of qwen38_hc_fp8 (pueue 170-172): HC shapes 336x10240, 10240x320, 320x10240 at M 1/7/64/1024 with real layer-0 weights",
+   "goal": "kernel correctness, determinism, speed vs cuBLAS BF16",
+   "runner": "src/test_qwen38_hc_fp8.py",
+   "status": "success",
+   "pueue_task": 172,
+   "result": "Kernel vs dequantized FP32 reference rel err <= 1.5e-3, repeat bit-identical everywhere; FP8 vs BF16 weight rel err 1-3% (E4M3). u1 first kernel 520 us at M1 (split-K sum by 31 adds, heavy decode); u2 cheap decode (E4M3 bits -> FP16 * 2^8) + GEMV for M<=8 + one sum; u3 timed by CUDA-graph replay (u1/u2 eager timings were launch-bound): M1 down336 35.6 vs BF16 19.0 us, up 26.6 vs 14.8 (FP8 GEMV ~100 GB/s vs cuBLAS ~360: needs tuning); M64 28.4/32.1, 17.8/18.9; M1024 280/271, 202/199 (level); M7 ~160 us (GEMV with 8-row broadcast, not used by decode)."
+  },
+  {
+   "label": "M10_vllm_pipe_fp8_hc_floor_20261103_i15",
+   "what": "5 pipelined end-to-end runs with Q38_RTX_FP8_HC=1 (FP8 hyper-connection matrices), k16, chunk 1024, autotune off, logprobs 5",
+   "goal": "FP8 HC within the LM-head jitter floor of BF16 HC (i13); VRAM",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 173,
+   "result": "PASS on the floor criterion. All 5 eb7d0aab4915. FP8 HC own floor max 1.25 / median 0.30; cross FP8 x BF16 (i13) max 1.875 / median 0.375, inside the BF16 floor max 2.125 (median slightly above 0.31). Margins token 0 2.125-3.125 (BF16 2.25-3.125), token 6 0.25-0.50 (0-0.625), token 11 0.125-1.375 (0.375-1.25); mean chosen-logprob shift -0.003 (max abs 0.071 over 32 positions): no systematic bias. 194 HC matrices 1.213 GiB BF16 -> 0.645 GiB FP8; vLLM model memory 4.22 -> 3.62 GiB. Prefill 261-269 tok/s (i13 265-273). Folder integration-20261103T224703Z."
+  },
+  {
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "goal": "KV capacity without prefix caching; does the 1024-token prefill peak still fit",
+   "label": "M10_vllm_kv_sweep_noprefix_1G_32k_20261103_s1",
+   "what": "1 pipelined run, FP8 HC, Q38_VLLM_PREFIX_CACHING=0, KV 1 GiB, max_model_len 32768",
+   "status": "success",
+   "pueue_task": 174,
+   "result": "PASS, eb7d0aab4915, prefill 273.7 tok/s. KV capacity 34,028 tokens per GiB (prefix caching on: 14,745): 31.6 KB/token instead of 72.8. Attention block size still 1568 (mamba page), group sizes (32768 x4, 4, 1568). Folder integration-20261103T225645Z."
+  },
+  {
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "goal": "KV capacity without prefix caching; does the 1024-token prefill peak still fit",
+   "label": "M10_vllm_kv_sweep_noprefix_2G_64k_20261103_s2",
+   "what": "as s1 with KV 2 GiB, max_model_len 65536",
+   "status": "success",
+   "pueue_task": 175,
+   "result": "PASS, eb7d0aab4915, prefill 274.1 tok/s. KV capacity 75,296 tokens (2 GiB). Folder integration-20261103T225825Z."
+  },
+  {
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "goal": "KV capacity without prefix caching; does the 1024-token prefill peak still fit",
+   "label": "M10_vllm_kv_sweep_noprefix_2p5G_80k_20261103_s3",
+   "what": "as s1 with KV 2.5 GiB, max_model_len 81920",
+   "status": "failed",
+   "pueue_task": 176,
+   "result": "OOM during the first prefill (vLLM start OK, KV capacity 94,631 tokens): qsa_select_paged_prefill allocates its indexer logits workspace, VLLM_SPARSE_INDEXER_MAX_LOGITS_MB = 512 MiB by default, with 494 MiB free. Cleanup: RECOVER_PEER_CLIENT restored 117 routes; ACS restored, DMA helper unloaded, MC registers unchanged, daemon READY 48 PARKED pid 25306, worker seq aligned. The workspace needs only rows x ceil(ctx/4) x 4 B (1024 x 20480 x 4 = 80 MiB at 81,920 ctx): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128 would free ~384 MiB. Folder integration-20261103T230020Z."
+  },
+  {
+   "label": "M10_bench_lcb_v6_probe3_20261104_p1",
+   "what": "benchmark-mode smoke: 3 LCB v6 problems (abc394_b easy, 3776 medium, arc193_d hard), thinking xhigh, T1.0/0.95/20, cap 32768",
+   "goal": "real thinking lengths; benchmark plumbing end to end",
+   "pre_reg": "all 3 produce output; plumbing checks pass",
+   "est_min": 30,
+   "runner": "src/run_qwen38_bench.sh",
+   "status": "success",
+   "pueue_task": 182,
+   "result": "abc394_b 241 tokens (stop) PASS 42/42 tests; arc193_d 32768 tokens CAPPED (no code); 3776 24,233 tokens (stop) PASS 42/42. Decode steady 52.7-52.8 tok/s. 14 runner checks OK. Scorer test (pueue 183) 2/3. Hard problems exceed 32k -> night cap 81,920. Folder qwen38-bench/lcb_v6_probe3-20261103T231709Z."
+  },
+  {
+   "label": "M10_bench_mmlu_redux_5shot_20261104_n1",
+   "what": "MMLU-Redux 2.0 'ok' questions (5,330, shuffled seed 20261104), 5-shot from cais/mmlu dev, no thinking, answer-letter logprobs (top 20); start deadline 02:30 CET",
+   "goal": "knowledge regression check against the base model (90.68, 5-shot)",
+   "pre_reg": "accuracy >= 88.7 = not hurt; < 87 flagged; expected ~1,700 questions before the deadline (SE ~0.7)",
+   "est_min": 110,
+   "runner": "src/run_qwen38_bench.sh",
+   "status": "success",
+   "pueue_task": 184,
+   "result": "2,628 of 5,330 shuffled questions by the 02:30 start deadline (00:38-02:30, ~2.5 s each), BENCH_VERIFY OK, 14 runner checks OK. Accuracy 90.98 +- 0.56 (macro over 57 subjects 90.67); no item without a letter in the top-20; preds A585/B651/C688/D704. Pre-registration (>= 88.7) met; base-model reference 90.68 (5-shot). Folder qwen38-bench/mmlu_redux_5shot-20261103T233754Z, score night-runs/scores/mmlu_redux_5shot-20261103T233754Z."
+  },
+  {
+   "label": "M10_bench_mmlu_redux_5shot_20261104_n1_score",
+   "what": "CPU scoring of n1 (score_mmlu.py)",
+   "goal": "accuracy, SE, macro subject average",
+   "pre_reg": "score line written",
+   "est_min": 1,
+   "runner": "src/run_bench_score.sh",
+   "status": "failed",
+   "pueue_task": 185,
+   "result": "exit 4: run folder root-owned, scorer (unprivileged user) could not write score.log/score.json. Requeued as _r2 with run_bench_score_v2.sh (pueue 187, success)."
+  },
+  {
+   "label": "M10_bench_lcb_v6_subset40_20261104_n1",
+   "what": "LiveCodeBench v6 (test6, 2025-01..04) subset 40 stratified 10/12/18, difficulties interleaved (seed 20261104); thinking template default (xhigh), T1.0 top_p 0.95 top_k 20, seed sha256(id), cap 81,920; all 40, no cutoff",
+   "goal": "coding regression check against the card's 91.9 (thinking model)",
+   "pre_reg": "pass@1 >= 80% = not hurt (n=40, SE ~5 pt); capped counted as fail and listed; < 70% flagged",
+   "est_min": 420,
+   "runner": "src/run_qwen38_bench.sh",
+   "status": "success",
+   "pueue_task": 186,
+   "result": "40/40 problems, 02:30-08:36 CET (6.1 h), 1,151,215 output tokens, decode steady 52.4-52.8 tok/s; BENCH_VERIFY OK, 14 runner checks OK. pass@1 35/40 = 87.5% (SE 5.2): easy 10/10, medium 12/12, hard 13/18. Capped at 81,920: 2 (arc190_c, arc193_d, both hard) -> 35/38 = 92.1% of the answers that finished (card 91.9). Other fails: abc397_d, arc192_b (wrong answer), abc392_f (IndexError in the generated code at test 16: a genuine model error). Output tokens per problem 104-81,920, median 30,440, mean 28,780. Pre-registration (>= 80%) met. Folder qwen38-bench/lcb_v6_subset40-20261104T013013Z, scores night-runs/scores/lcb_v6_subset40-20261104T013013Z."
+  },
+  {
+   "label": "M10_bench_lcb_v6_subset40_20261104_n1_score",
+   "what": "CPU scoring of the LCB run (score_lcb.py, public+private tests, 6 s per test)",
+   "goal": "pass@1 by difficulty, capped count",
+   "pre_reg": "score line written",
+   "est_min": 5,
+   "runner": "src/run_bench_score.sh",
+   "status": "removed before start",
+   "pueue_task": 187,
+   "result": "replaced by _r2 (pueue 188, v2 scorer) for the same permission reason"
+  },
+  {
+   "label": "M10_bench_mmlu_redux_5shot_20261104_n1_score_r2",
+   "what": "rescore of n1 with run_bench_score_v2.sh (outputs to night-runs/scores/)",
+   "goal": "score after the permission failure",
+   "pre_reg": "score line written",
+   "est_min": 1,
+   "runner": "src/run_bench_score_v2.sh",
+   "status": "success",
+   "pueue_task": 187,
+   "result": "MMLU_SCORE 90.98 +- 0.56, 2628 items, macro 90.67"
+  },
+  {
+   "label": "M10_bench_lcb_v6_subset40_20261104_n1_score_r2",
+   "what": "CPU scoring of the LCB run with run_bench_score_v2.sh",
+   "goal": "pass@1 by difficulty, capped count",
+   "pre_reg": "score line written",
+   "est_min": 5,
+   "runner": "src/run_bench_score_v2.sh",
+   "status": "success",
+   "pueue_task": 188,
+   "result": "LCB_TOTAL pass 35/40 (87.5%), capped 2, easy 10/10, medium 12/12, hard 13/18"
+  }
+ ]
+}

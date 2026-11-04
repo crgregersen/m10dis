@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+
+# Read-only Tesla M10 cooling dashboard. Hardware is discovered by driver
+# name, not by hwmon number or CUDA ordinal.
+set -uo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage: fanstatus [--watch [SECONDS]] [--color|--no-color] [--help]
+
+Show GPU/CPU temperatures, fan speeds, PWM values, drivers and service state.
+No sudo privileges are required.
+
+  -w, --watch [SECONDS]  refresh continuously (default: 1 second)
+      --color            force ANSI colors
+      --no-color         disable ANSI colors
+  -h, --help             show this help
+EOF
+}
+
+interval= color_mode=auto
+while (( $# )); do
+	case $1 in
+		-h|--help) usage; exit 0 ;;
+		-w|--watch)
+			interval=1
+			if [[ ${2:-} =~ ^[0-9]+([.][0-9]+)?$ ]]; then interval=$2; shift; fi
+			;;
+		--color) color_mode=always ;;
+		--no-color) color_mode=never ;;
+		*) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+	esac
+	shift
+done
+
+if [[ $color_mode == always || ($color_mode == auto && -t 1 && -z ${NO_COLOR:-}) ]]; then
+	RESET=$'\e[0m'; BOLD=$'\e[1m'; DIM=$'\e[2m'
+	GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RED=$'\e[31m'; CYAN=$'\e[36m'
+else
+	RESET= BOLD= DIM= GREEN= YELLOW= RED= CYAN=
+fi
+
+trim() {
+	local v=$1
+	v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+	printf '%s' "$v"
+}
+
+find_hwmon() {
+	local wanted=$1 h name
+	for h in /sys/class/hwmon/hwmon*; do
+		[[ -r $h/name ]] || continue
+		read -r name <"$h/name"
+		[[ $name == "$wanted" ]] && { printf '%s' "$h"; return 0; }
+	done
+	return 1
+}
+
+read_attr() {
+	local value
+	if [[ -r $1 ]]; then read -r value <"$1"; printf '%s' "$value"; else printf '-'; fi
+}
+
+repeat_char() {
+	local char=$1 count=$2 result= i
+	for ((i=0; i<count; i++)); do result+=$char; done
+	printf '%s' "$result"
+}
+
+pwm_bar() {
+	local pwm=$1 width=${2:-12} filled empty
+	if ! [[ $pwm =~ ^[0-9]+$ ]]; then printf '%*s' "$width" '-'; return; fi
+	filled=$(( (pwm * width + 127) / 255 )); (( filled > width )) && filled=$width
+	empty=$((width - filled))
+	printf '%s%s' "$(repeat_char '█' "$filled")" "$(repeat_char '░' "$empty")"
+}
+
+pwm_display() {
+	if [[ $1 =~ ^[0-9]+$ ]]; then
+		printf '%3d  %3d%%' "$1" "$(( ($1 * 100 + 127) / 255 ))"
+	else printf '%9s' '-'; fi
+}
+
+mode_name() {
+	case $1 in 0) printf firmware;; 1) printf manual;; 2) printf auto;; -) printf -;; *) printf 'mode-%s' "$1";; esac
+}
+
+temperature_display() {
+	local value=$1 color=$GREEN
+	if ! [[ $value =~ ^-?[0-9]+$ ]]; then printf '%7s' '-'; return; fi
+	(( value >= 70 )) && color=$RED
+	(( value >= 55 && value < 70 )) && color=$YELLOW
+	printf '%s%3d°C%s' "$color" "$value" "$RESET"
+}
+
+bank_temperature_display() {
+	local value=$1 color=$GREEN
+	if ! [[ $value =~ ^-?[0-9]+$ ]]; then printf '%5s' '-'; return; fi
+	(( value >= 70 )) && color=$RED
+	(( value >= 55 && value < 70 )) && color=$YELLOW
+	printf '%s%3d°C%s' "$color" "$value" "$RESET"
+}
+
+section() {
+	printf '\n%s%s%s\n' "$BOLD$CYAN" "$1" "$RESET"
+	printf '%s\n' '────────────────────────────────────────────────────────────────────────────'
+}
+
+box_row() {
+	# 76 visible columns: border + space + 72 characters + space + border.
+	printf '│ %-72.72s │\n' "$1"
+}
+
+dashboard_header() {
+	local title=' M10 COOLING DASHBOARD ' inner=74 left right
+	local identity health
+	left=$(( (inner - ${#title}) / 2 ))
+	right=$(( inner - ${#title} - left ))
+	printf '%s╭%s%s%s╮%s\n' "$BOLD$CYAN" \
+		"$(repeat_char '─' "$left")" "$title" "$(repeat_char '─' "$right")" "$RESET"
+	identity="$(date '+%F  %T %Z')    kernel $(uname -r)"
+	health="fan service: $service    NCT driver: ${driver:-not loaded}"
+	box_row "$identity"
+	box_row "$health"
+	printf '%s╰%s╯%s\n' "$BOLD$CYAN" "$(repeat_char '─' "$inner")" "$RESET"
+}
+
+fan_row() {
+	local label=$1 temp=$2 pwm=$3 rpm=$4 mode=$5 rpm_text
+	if [[ $rpm =~ ^[0-9]+$ ]] && (( rpm > 0 )); then rpm_text=$(printf "%'d" "$rpm"); else rpm_text='-'; fi
+	printf '  %-18s %5s %9s  %s  %9s RPM  %-9s\n' \
+		"$label" "$(bank_temperature_display "$temp")" "$(pwm_display "$pwm")" \
+		"$(pwm_bar "$pwm")" "$rpm_text" "$mode"
+}
+
+show_status() {
+	local nct arctic coretemp service driver output line icon color
+	local bdf name temp pstate serial uuid max_m10=-999 count_m10=0 m10_index=0 card_index card_temp current
+	local -A serial_temps=() serial_cards=()
+	local label input package_temp=- channel pwm rpm mode
+	local -a gpu_lines m10_card_temps
+
+	driver=$(lsmod | awk '$1=="nct6687" || $1=="nct6683" {printf "%s%s",sep,$1; sep="+"}')
+	service=$(systemctl is-active m10-fancontrol.service 2>/dev/null || true)
+	icon='●'; color=$RED; [[ $service == active ]] && color=$GREEN
+
+	dashboard_header
+
+	section 'GPU THERMALS'
+	printf '  %-11s %-12s %-27s %7s  %7s\n' DEVICE 'PCI BDF' MODEL TEMP STATE
+	if command -v nvidia-smi >/dev/null 2>&1; then
+		output=$(timeout 3 nvidia-smi --query-gpu=pci.bus_id,name,temperature.gpu,pstate,serial,uuid --format=csv,noheader,nounits 2>/dev/null) || output=
+		if [[ -n $output ]]; then
+			mapfile -t gpu_lines <<<"$output"
+			for line in "${gpu_lines[@]}"; do
+				IFS=',' read -r bdf name temp pstate serial uuid <<<"$line"
+				serial=$(trim "$serial"); uuid=$(trim "$uuid")
+				bdf=$(trim "$bdf"); name=$(trim "$name"); temp=$(trim "$temp"); pstate=$(trim "$pstate")
+				if [[ $name == 'Tesla M10' ]]; then
+					card_index=$((m10_index/4))
+					serial_cards[$serial]=$((card_index+1))
+					label=$(printf 'M10 %d.%d' "$((card_index+1))" "$((m10_index%4))")
+					((m10_index+=1, count_m10+=1))
+					if [[ $temp =~ ^[0-9]+$ ]]; then
+						current=${serial_temps[$serial]:--999}
+						(( temp > current )) && serial_temps[$serial]=$temp
+						(( temp > max_m10 )) && max_m10=$temp
+						current=${m10_card_temps[$card_index]:--999}
+						(( temp > current )) && m10_card_temps[$card_index]=$temp
+					fi
+				else label=RTX; fi
+				printf '  %-11s %-12s %-27s %7s  %7s\n' "$label" "${bdf#00000000:}" "$name" "$(temperature_display "$temp")" "$pstate"
+			done
+		else printf '  %sNo data returned by nvidia-smi%s\n' "$RED" "$RESET"; fi
+	else printf '  %snvidia-smi is unavailable%s\n' "$RED" "$RESET"; fi
+	if (( count_m10 > 0 )); then
+		printf '\n  %sPeak M10%s  %s   %d GM107 GPU(s) / %d complete card(s) visible\n' \
+			"$BOLD" "$RESET" "$(temperature_display "$max_m10")" "$count_m10" "$((count_m10/4))"
+	fi
+
+	coretemp=$(find_hwmon coretemp || true)
+	if [[ -n $coretemp ]]; then
+		for label in "$coretemp"/temp*_label; do
+			[[ -r $label ]] || continue
+			if [[ $(<"$label") == 'Package id 0' ]]; then input=${label%_label}_input; package_temp=$(( $(read_attr "$input")/1000 )); break; fi
+		done
+	fi
+
+	section 'FAN BANKS'
+	printf '  %-18s %5s %9s  %-12s  %13s  %-9s\n' 'BANK / HEADER' TEMP PWM OUTPUT SPEED MODE
+	nct=$(find_hwmon nct6683 || find_hwmon nct6687 || true)
+	if [[ -n $nct ]]; then
+		# Physical mapping measured under per-bank load on 2026-10-27:
+		# pwm1/fan1 -> PCI card group 0b:00.0-0e:00.0 (M10 #2)
+		# pwm3/fan4 -> PCI card group 05:00.0-08:00.0 (M10 #1)
+		fan_row 'MB fan #1 / M10 #2' "${m10_card_temps[1]:--}" "$(read_attr "$nct/pwm1")" "$(read_attr "$nct/fan1_input")" "$(mode_name "$(read_attr "$nct/pwm1_enable")")"
+		fan_row 'CPU / board fan' "$package_temp" "$(read_attr "$nct/pwm2")" "$(read_attr "$nct/fan2_input")" "$(mode_name "$(read_attr "$nct/pwm2_enable")")"
+		fan_row 'MB fan #2 / M10 #1' "${m10_card_temps[0]:--}" "$(read_attr "$nct/pwm3")" "$(read_attr "$nct/fan4_input")" "$(mode_name "$(read_attr "$nct/pwm3_enable")")"
+	else printf '  %sMotherboard NCT controller not found%s\n' "$RED" "$RESET"; fi
+
+	arctic=$(find_hwmon arctic_fan || true)
+	if [[ -n $arctic ]]; then
+		for channel in 1 2 3 4; do
+			pwm=$(read_attr "$arctic/pwm$channel"); rpm=$(read_attr "$arctic/fan${channel}_input")
+			card_index=$((channel+1)); card_temp=${m10_card_temps[$card_index]:--}
+			# Physical fan ownership survives PCI reordering and card swaps.
+			case $channel in
+				1) serial=0420318049628 ;;
+				2) serial=0424118104694 ;;
+				3) serial=0424118105324 ;;
+				4) serial=0421318008714 ;;
+			esac
+			card_temp=${serial_temps[$serial]:--}
+			mode=unused; [[ $rpm =~ ^[0-9]+$ ]] && (( rpm > 0 )) && mode=connected
+			label="Arctic ch.$channel"
+			if [[ -n ${serial_cards[$serial]:-} ]]; then
+				label+=" M10 #${serial_cards[$serial]}"
+			elif [[ $serial != unassigned ]]; then
+				label+=' absent'
+			fi
+			fan_row "$label" "$card_temp" "$pwm" "$rpm" "$mode"
+		done
+	else printf '  %sArctic USB controller not found%s\n' "$RED" "$RESET"; fi
+
+	section 'SUMMARY'
+	printf '  CPU package: %-7s   M10 peak: %-7s   fan service: %s%s%s\n' \
+		"$(temperature_display "$package_temp")" "$(temperature_display "$max_m10")" "$color" "$service" "$RESET"
+	printf '  %sMotherboard hwmon: %s   Arctic hwmon: %s%s\n' "$DIM" "${nct:--}" "${arctic:--}" "$RESET"
+}
+
+while :; do
+	[[ -n $interval ]] && printf '\033[H\033[2J'
+	show_status
+	[[ -n $interval ]] || break
+	sleep "$interval"
+done

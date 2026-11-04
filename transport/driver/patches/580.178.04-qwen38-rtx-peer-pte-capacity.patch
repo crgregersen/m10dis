@@ -1,0 +1,11 @@
+--- a/nvidia-uvm/uvm_ioctl.h
++++ b/nvidia-uvm/uvm_ioctl.h
+@@ -1707,7 +1707,7 @@
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_QUERY                             1U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_APPLY                             2U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_RESTORE                           3U
+-#define UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE                           128U
++#define UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE                           512U
+ 
+ typedef struct
+ {

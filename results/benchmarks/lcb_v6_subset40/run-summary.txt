@@ -1,0 +1,3 @@
+BENCH_SUMMARY,results,40,of,40,generate,40,choice,0,capped,2,tokens,1151215,seconds,21951
+BENCH_VERIFY,OK
+BENCH_DONE,rc,0,runs/qwen38-bench/lcb_v6_subset40-20261104T013013Z

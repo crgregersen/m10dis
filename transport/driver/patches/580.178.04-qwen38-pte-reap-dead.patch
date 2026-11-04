@@ -1,0 +1,65 @@
+--- a/nvidia-uvm/uvm_tools.c
++++ b/nvidia-uvm/uvm_tools.c
+@@ -7068,6 +7068,39 @@
+     return count;
+ }
+ 
++// Release only diagnostic references whose VA-space teardown has completed.
++// The retained reference keeps each object alive, and DEAD is terminal: its
++// page tables and RM address space have already been destroyed by UVM.
++// Live entries are deliberately untouched, even if their old PTE address
++// happens to read as zero.
++static NvU32 glm53_multi_pte_reap_dead_locked(void)
++{
++    NvU32 released = 0;
++    NvU32 i;
++
++    for (i = 0; i < UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE; ++i) {
++        glm53_multi_pte_remap_state_t *entry = &g_glm53_multi_pte_remap_state[i];
++        uvm_gpu_va_space_t *gpu_va_space;
++
++        if (!entry->active)
++            continue;
++
++        gpu_va_space = entry->gpu_va_space;
++        if (!gpu_va_space ||
++            uvm_gpu_va_space_state(gpu_va_space) != UVM_GPU_VA_SPACE_STATE_DEAD)
++            continue;
++
++        memset(entry, 0, sizeof(*entry));
++        uvm_gpu_va_space_release(gpu_va_space);
++        ++released;
++    }
++
++    if (released)
++        pr_info("nvidia-uvm: GLM53 PTE recovery released %u records for DEAD VA spaces\n", released);
++
++    return released;
++}
++
+ static void glm53_multi_pte_decode_pte_outputs(UVM_GLM53_MULTI_PTE_REMAP_PARAMS *params,
+                                                NvU64 pte,
+                                                bool maxwell_pte_format)
+@@ -7544,6 +7577,12 @@
+         case UVM_GLM53_MULTI_PTE_REMAP_OP_RESTORE:
+             status = glm53_multi_pte_restore_locked(params);
+             break;
++        case UVM_GLM53_MULTI_PTE_REMAP_OP_REAP_DEAD:
++            // No caller-supplied address or mapping ID is trusted for this
++            // sweep. Only terminal DEAD VA-space references are eligible.
++            (void)glm53_multi_pte_reap_dead_locked();
++            status = NV_OK;
++            break;
+         default:
+             status = NV_ERR_INVALID_ARGUMENT;
+             break;
+--- a/nvidia-uvm/uvm_ioctl.h
++++ b/nvidia-uvm/uvm_ioctl.h
+@@ -1707,6 +1707,7 @@
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_QUERY                             1U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_APPLY                             2U
+ #define UVM_GLM53_MULTI_PTE_REMAP_OP_RESTORE                           3U
++#define UVM_GLM53_MULTI_PTE_REMAP_OP_REAP_DEAD                         4U
+ #define UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE                           512U
+ 
+ typedef struct

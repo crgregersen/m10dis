@@ -1,0 +1,32 @@
+[Unit]
+Description=Tesla M10 fan-bank control
+Documentation=man:fancontrol(8)
+After=systemd-modules-load.service nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/libexec/m10-fancontrol-prepare
+ExecStartPre=/usr/local/sbin/m10-fancontrol --check /etc/m10-fancontrol.conf
+ExecStart=/usr/local/sbin/m10-fancontrol /etc/m10-fancontrol.conf
+ExecStopPost=/usr/local/libexec/m10-fan-full
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateDevices=false
+PrivateNetwork=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/run /sys/class/hwmon /sys/devices
+
+[Install]
+WantedBy=multi-user.target

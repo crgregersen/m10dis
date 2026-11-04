@@ -1,0 +1,40 @@
+{"id": "abc388_f", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 49517, "thinking_tokens": 48796, "finish_reason": "stop"}
+{"id": "3779", "difficulty": "medium", "pass": true, "why": "42 tests", "output_tokens": 30173, "thinking_tokens": 30008, "finish_reason": "stop"}
+{"id": "abc390_b", "difficulty": "easy", "pass": true, "why": "43 tests", "output_tokens": 1193, "thinking_tokens": 1068, "finish_reason": "stop"}
+{"id": "3744", "difficulty": "hard", "pass": true, "why": "42 tests", "output_tokens": 30802, "thinking_tokens": 30423, "finish_reason": "stop"}
+{"id": "3760", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 4306, "thinking_tokens": 4135, "finish_reason": "stop"}
+{"id": "3687", "difficulty": "hard", "pass": true, "why": "42 tests", "output_tokens": 48007, "thinking_tokens": 47122, "finish_reason": "stop"}
+{"id": "3799", "difficulty": "easy", "pass": true, "why": "35 tests", "output_tokens": 2458, "thinking_tokens": 2309, "finish_reason": "stop"}
+{"id": "arc195_e", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 39124, "thinking_tokens": 38470, "finish_reason": "stop"}
+{"id": "3721", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 7945, "thinking_tokens": 7622, "finish_reason": "stop"}
+{"id": "3778", "difficulty": "easy", "pass": true, "why": "33 tests", "output_tokens": 364, "thinking_tokens": 289, "finish_reason": "stop"}
+{"id": "abc397_d", "difficulty": "hard", "pass": false, "why": "test 41/43: wrong answer", "output_tokens": 30707, "thinking_tokens": 30240, "finish_reason": "stop"}
+{"id": "3793", "difficulty": "medium", "pass": true, "why": "44 tests", "output_tokens": 33871, "thinking_tokens": 33556, "finish_reason": "stop"}
+{"id": "3801", "difficulty": "hard", "pass": true, "why": "42 tests", "output_tokens": 63151, "thinking_tokens": 61875, "finish_reason": "stop"}
+{"id": "abc389_b", "difficulty": "easy", "pass": true, "why": "42 tests", "output_tokens": 663, "thinking_tokens": 591, "finish_reason": "stop"}
+{"id": "arc192_b", "difficulty": "hard", "pass": false, "why": "test 20/43: wrong answer", "output_tokens": 36528, "thinking_tokens": 36335, "finish_reason": "stop"}
+{"id": "3776", "difficulty": "medium", "pass": true, "why": "42 tests", "output_tokens": 41089, "thinking_tokens": 40459, "finish_reason": "stop"}
+{"id": "arc196_b", "difficulty": "hard", "pass": true, "why": "2 tests", "output_tokens": 70352, "thinking_tokens": 69758, "finish_reason": "stop"}
+{"id": "abc388_a", "difficulty": "easy", "pass": true, "why": "42 tests", "output_tokens": 104, "thinking_tokens": 74, "finish_reason": "stop"}
+{"id": "abc388_d", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 11662, "thinking_tokens": 11355, "finish_reason": "stop"}
+{"id": "abc394_f", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 42602, "thinking_tokens": 41858, "finish_reason": "stop"}
+{"id": "abc392_f", "difficulty": "hard", "pass": false, "why": "test 16/42: error 1 p_1idovlk/sol.py\", line 38, in main\n    ans[pos - 1] = x\n    ~~~^^^^^^^^^\nIndexError: list assignment index out of range", "output_tokens": 55608, "thinking_tokens": 55254, "finish_reason": "stop"}
+{"id": "3754", "difficulty": "medium", "pass": true, "why": "42 tests", "output_tokens": 13267, "thinking_tokens": 13118, "finish_reason": "stop"}
+{"id": "abc393_b", "difficulty": "easy", "pass": true, "why": "43 tests", "output_tokens": 465, "thinking_tokens": 369, "finish_reason": "stop"}
+{"id": "3770", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 71209, "thinking_tokens": 69832, "finish_reason": "stop"}
+{"id": "abc396_c", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 6453, "thinking_tokens": 6155, "finish_reason": "stop"}
+{"id": "arc190_c", "difficulty": "hard", "pass": false, "why": "capped (no </think>)", "output_tokens": 81920, "thinking_tokens": 81920, "finish_reason": "length"}
+{"id": "abc400_a", "difficulty": "easy", "pass": true, "why": "43 tests", "output_tokens": 151, "thinking_tokens": 102, "finish_reason": "stop"}
+{"id": "abc400_e", "difficulty": "hard", "pass": true, "why": "5 tests", "output_tokens": 37837, "thinking_tokens": 37538, "finish_reason": "stop"}
+{"id": "3714", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 45582, "thinking_tokens": 44991, "finish_reason": "stop"}
+{"id": "abc399_a", "difficulty": "easy", "pass": true, "why": "44 tests", "output_tokens": 158, "thinking_tokens": 92, "finish_reason": "stop"}
+{"id": "abc391_f", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 75862, "thinking_tokens": 74787, "finish_reason": "stop"}
+{"id": "abc398_b", "difficulty": "medium", "pass": true, "why": "44 tests", "output_tokens": 955, "thinking_tokens": 841, "finish_reason": "stop"}
+{"id": "arc194_b", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 25106, "thinking_tokens": 24819, "finish_reason": "stop"}
+{"id": "abc394_b", "difficulty": "easy", "pass": true, "why": "42 tests", "output_tokens": 241, "thinking_tokens": 158, "finish_reason": "stop"}
+{"id": "arc193_d", "difficulty": "hard", "pass": false, "why": "capped (no </think>)", "output_tokens": 81920, "thinking_tokens": 81920, "finish_reason": "length"}
+{"id": "arc194_a", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 22320, "thinking_tokens": 22077, "finish_reason": "stop"}
+{"id": "abc390_f", "difficulty": "hard", "pass": true, "why": "43 tests", "output_tokens": 37826, "thinking_tokens": 37540, "finish_reason": "stop"}
+{"id": "3753", "difficulty": "easy", "pass": true, "why": "33 tests", "output_tokens": 1591, "thinking_tokens": 1453, "finish_reason": "stop"}
+{"id": "arc195_a", "difficulty": "medium", "pass": true, "why": "43 tests", "output_tokens": 8660, "thinking_tokens": 8342, "finish_reason": "stop"}
+{"id": "abc393_f", "difficulty": "hard", "pass": true, "why": "42 tests", "output_tokens": 39466, "thinking_tokens": 38901, "finish_reason": "stop"}

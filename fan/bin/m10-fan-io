@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+# Narrow fan2go command backend for the Tesla M10 shroud fan. It can address
+# only nct6683 pwm3/fan4 and rejects values outside the pre-tested safe range.
+
+set -Eeuo pipefail
+
+readonly MIN_PWM=120
+readonly MAX_PWM=200
+
+mapfile -t names < <(grep -l '^nct6683$' /sys/class/hwmon/hwmon*/name 2>/dev/null)
+if (( ${#names[@]} != 1 )); then
+	printf 'm10-fan-io: expected one nct6683 hwmon device, found %d\n' \
+		"${#names[@]}" >&2
+	exit 1
+fi
+readonly H=${names[0]%/name}
+
+case ${1:-} in
+	get-pwm)
+		cat "$H/pwm3"
+		;;
+	get-rpm)
+		cat "$H/fan4_input"
+		;;
+	set-pwm)
+		value=${2:-}
+		if [[ ! $value =~ ^[0-9]+$ ]] || \
+			(( value < MIN_PWM || value > MAX_PWM )); then
+			printf 'm10-fan-io: refusing PWM value %q; allowed range is %d..%d\n' \
+				"$value" "$MIN_PWM" "$MAX_PWM" >&2
+			exit 1
+		fi
+		# Load the requested safe value before selecting manual mode.
+		printf '%d\n' "$value" >"$H/pwm3"
+		printf '1\n' >"$H/pwm3_enable"
+		;;
+	*)
+		printf 'Usage: %s {get-pwm|get-rpm|set-pwm VALUE}\n' "$0" >&2
+		exit 2
+		;;
+esac

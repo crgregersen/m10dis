@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+# Immediately lock the Tesla M10 shroud fans at measured full speed.
+
+set -Eeuo pipefail
+
+if (( EUID != 0 )); then
+	printf 'Run with sudo: sudo %s\n' "$0" >&2
+	exit 1
+fi
+
+hwmon=
+cpu_pwm_before=
+cpu_enable_before=
+
+locate_hwmon() {
+	local -a matches
+	mapfile -t matches < <(/usr/bin/grep -lFx nct6683 /sys/class/hwmon/hwmon*/name 2>/dev/null || true)
+	if (( ${#matches[@]} != 1 )); then
+		printf 'Expected exactly one nct6683 hwmon device; found %d\n' "${#matches[@]}" >&2
+		return 1
+	fi
+	hwmon=${matches[0]%/name}
+}
+
+force_full() {
+	locate_hwmon
+	[[ -w $hwmon/pwm1 && -w $hwmon/pwm1_enable && \
+	   -w $hwmon/pwm3 && -w $hwmon/pwm3_enable ]] || {
+		printf 'The M10 fan control attributes are not writable.\n' >&2
+		return 1
+	}
+	# Manual mode first, then immediately assert the measured full-speed value.
+	for channel in 1 3; do
+		printf '1\n' >"$hwmon/pwm${channel}_enable"
+		printf '200\n' >"$hwmon/pwm${channel}"
+	done
+}
+
+locate_hwmon
+cpu_pwm_before=$(<"$hwmon/pwm2")
+cpu_enable_before=$(<"$hwmon/pwm2_enable")
+
+# Assert full speed immediately. Stopping fancontrol can restore its saved state,
+# so assert full speed a second time after the service has stopped.
+force_full
+/usr/bin/systemctl stop m10-fancontrol.service
+force_full
+
+[[ $(<"$hwmon/pwm1") == 200 && $(<"$hwmon/pwm1_enable") == 1 && \
+   $(<"$hwmon/pwm3") == 200 && $(<"$hwmon/pwm3_enable") == 1 ]] || {
+	printf 'Emergency fan state could not be verified.\n' >&2
+	exit 1
+}
+[[ $(<"$hwmon/pwm2") == "$cpu_pwm_before" && \
+   $(<"$hwmon/pwm2_enable") == "$cpu_enable_before" ]] || {
+	printf 'WARNING: CPU channel changed unexpectedly.\n' >&2
+	exit 1
+}
+
+printf 'EMERGENCY MODE ACTIVE: M10 pwm1=200 fan1=%s RPM; pwm3=200 fan4=%s RPM\n' \
+	"$(<"$hwmon/fan1_input")" "$(<"$hwmon/fan4_input")"
+printf 'Automatic M10 fan control is stopped. The CPU channel was untouched.\n'
+printf 'To restore automatic control: sudo systemctl start m10-fancontrol.service\n'

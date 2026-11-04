@@ -1,0 +1,32 @@
+From: Aureo Serrano de Souza <aureo.serrano@arctic.de>
+Subject: hwmon: arctic_fan_controller: dual-license GPL-2.0-or-later OR BSD-2-Clause
+Date: Thu, 10 Sep 2026 13:04:00 +0800
+
+The in-tree driver is solely authored by ARCTIC. Keep the existing
+GPL-2.0-or-later grant and add BSD-2-Clause so the files may be used
+under either license.
+
+Signed-off-by: Aureo Serrano de Souza <aureo.serrano@arctic.de>
+---
+ Documentation/hwmon/arctic_fan_controller.rst | 2 +-
+ drivers/hwmon/arctic_fan_controller.c         | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/hwmon/arctic_fan_controller.c b/drivers/hwmon/arctic_fan_controller.c
+index 9a609257273..9eb83a149cd 100644
+--- a/drivers/hwmon/arctic_fan_controller.c
++++ b/drivers/hwmon/arctic_fan_controller.c
+@@ -1,4 +1,4 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-License-Identifier: GPL-2.0-or-later OR BSD-2-Clause
+ /*
+  * Linux hwmon driver for ARCTIC Fan Controller
+  *
+@@ -375,4 +375,4 @@ module_hid_driver(arctic_fan_driver);
+ 
+ MODULE_AUTHOR("Aureo Serrano de Souza <aureo.serrano@arctic.de>");
+ MODULE_DESCRIPTION("HID hwmon driver for ARCTIC Fan Controller");
+-MODULE_LICENSE("GPL");
++MODULE_LICENSE("Dual BSD/GPL");
+-- 
+2.43.0

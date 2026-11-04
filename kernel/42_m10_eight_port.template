@@ -1,0 +1,13 @@
+#!/bin/sh
+exec tail -n +3 $0
+
+menuentry 'Ubuntu M10 eight-port late-enable test (7.0.14-m10late8)' --class ubuntu --class gnu-linux --class gnu --class os {
+    recordfail
+    load_video
+    insmod gzio
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root 4c033e9e-5f45-48aa-b751-b95145dcf49e
+    linux /vmlinuz-7.0.14-m10late8 root=UUID=f3c16443-4a87-4304-bc7f-ef74953a1486 ro crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M pci=assign-busses,realloc=on,hpbussize=6,hpiosize=0,hpmmiosize=128M,hpmmioprefsize=2G
+    initrd /initrd.img-7.0.14-m10late8
+}

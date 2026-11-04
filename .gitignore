@@ -1,0 +1,20 @@
+# build products
+/build/
+*.o
+*.so
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.cubin
+*.fatbin
+Module.symvers
+modules.order
+__pycache__/
+*.py[cod]
+# local environment and runs
+/.venv-vllm
+/runs/
+/m10dis.local.env
+boot/results/
+boot/build/

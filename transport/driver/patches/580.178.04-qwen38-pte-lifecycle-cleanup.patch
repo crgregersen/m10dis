@@ -1,0 +1,63 @@
+--- a/nvidia-uvm/uvm_tools.h
++++ b/nvidia-uvm/uvm_tools.h
+@@ -43,6 +43,9 @@
+ NV_STATUS uvm_api_tools_get_processor_uuid_table_v2(UVM_TOOLS_GET_PROCESSOR_UUID_TABLE_V2_PARAMS *params,
+                                                     struct file *filp);
+ NV_STATUS uvm_api_tools_flush_events(UVM_TOOLS_FLUSH_EVENTS_PARAMS *params, struct file *filp);
++
++// Release guarded PTE records after the referenced GPU VA-space teardown completed.
++void uvm_glm53_multi_pte_remap_gpu_va_space_destroyed(uvm_gpu_va_space_t *gpu_va_space);
+ NV_STATUS uvm_api_glm53_read_phys_vidmem(UVM_GLM53_READ_PHYS_VIDMEM_PARAMS *params, struct file *filp);
+ NV_STATUS uvm_api_glm53_phys_reader_self_test(UVM_GLM53_PHYS_READER_SELF_TEST_PARAMS *params, struct file *filp);
+ NV_STATUS uvm_api_glm53_list_va_space_pdbs(UVM_GLM53_LIST_VA_SPACE_PDBS_PARAMS *params, struct file *filp);
+--- a/nvidia-uvm/uvm_tools.c
++++ b/nvidia-uvm/uvm_tools.c
+@@ -7556,6 +7556,36 @@
+     return status;
+ }
+ 
++// Called only after destroy_gpu_va_space() has removed all page tables and
++// destroyed the RM address space. Entries held by this diagnostic otherwise
++// retain the dead object and consume a global slot indefinitely.
++void uvm_glm53_multi_pte_remap_gpu_va_space_destroyed(uvm_gpu_va_space_t *gpu_va_space)
++{
++    NvU32 i;
++    NvU32 released = 0;
++
++    UVM_ASSERT(gpu_va_space);
++    UVM_ASSERT(uvm_gpu_va_space_state(gpu_va_space) == UVM_GPU_VA_SPACE_STATE_DEAD ||
++               uvm_gpu_va_space_state(gpu_va_space) == UVM_GPU_VA_SPACE_STATE_INIT);
++
++    mutex_lock(&g_glm53_multi_pte_remap_mutex);
++    for (i = 0; i < UVM_GLM53_MULTI_PTE_REMAP_MAX_ACTIVE; ++i) {
++        glm53_multi_pte_remap_state_t *entry = &g_glm53_multi_pte_remap_state[i];
++        if (!entry->active || entry->gpu_va_space != gpu_va_space)
++            continue;
++
++        // An INIT VA space was never eligible for APPLY.
++        UVM_ASSERT(uvm_gpu_va_space_state(gpu_va_space) == UVM_GPU_VA_SPACE_STATE_DEAD);
++        memset(entry, 0, sizeof(*entry));
++        ++released;
++        uvm_gpu_va_space_release(gpu_va_space);
++    }
++    mutex_unlock(&g_glm53_multi_pte_remap_mutex);
++
++    if (released)
++        pr_info("nvidia-uvm: GLM53 PTE lifecycle cleanup released %u dead VA-space records\n", released);
++}
++
+ NV_STATUS uvm_api_glm53_local_cache_sync(UVM_GLM53_LOCAL_CACHE_SYNC_PARAMS *params, struct file *filp)
+ {
+     NvProcessorUuid gpu_uuid = params->gpu_uuid;
+--- a/nvidia-uvm/uvm_va_space.c
++++ b/nvidia-uvm/uvm_va_space.c
+@@ -1500,6 +1500,9 @@
+ 
+     uvm_ats_unbind_gpu(gpu_va_space);
+ 
++    // The page tree and RM address space are gone. Drop any diagnostic
++    // references now, before releasing this function's final reference.
++    uvm_glm53_multi_pte_remap_gpu_va_space_destroyed(gpu_va_space);
+ 
+     uvm_gpu_va_space_release(gpu_va_space);
+ }

@@ -1,0 +1,44 @@
+LCB_SCORE,abc388_f,hard,PASS,43 tests,tokens,49517
+LCB_SCORE,3779,medium,PASS,42 tests,tokens,30173
+LCB_SCORE,abc390_b,easy,PASS,43 tests,tokens,1193
+LCB_SCORE,3744,hard,PASS,42 tests,tokens,30802
+LCB_SCORE,3760,medium,PASS,43 tests,tokens,4306
+LCB_SCORE,3687,hard,PASS,42 tests,tokens,48007
+LCB_SCORE,3799,easy,PASS,35 tests,tokens,2458
+LCB_SCORE,arc195_e,hard,PASS,43 tests,tokens,39124
+LCB_SCORE,3721,medium,PASS,43 tests,tokens,7945
+LCB_SCORE,3778,easy,PASS,33 tests,tokens,364
+LCB_SCORE,abc397_d,hard,FAIL,test 41/43: wrong answer,tokens,30707
+LCB_SCORE,3793,medium,PASS,44 tests,tokens,33871
+LCB_SCORE,3801,hard,PASS,42 tests,tokens,63151
+LCB_SCORE,abc389_b,easy,PASS,42 tests,tokens,663
+LCB_SCORE,arc192_b,hard,FAIL,test 20/43: wrong answer,tokens,36528
+LCB_SCORE,3776,medium,PASS,42 tests,tokens,41089
+LCB_SCORE,arc196_b,hard,PASS,2 tests,tokens,70352
+LCB_SCORE,abc388_a,easy,PASS,42 tests,tokens,104
+LCB_SCORE,abc388_d,medium,PASS,43 tests,tokens,11662
+LCB_SCORE,abc394_f,hard,PASS,43 tests,tokens,42602
+LCB_SCORE,abc392_f,hard,FAIL,test 16/42: error 1 p_1idovlk/sol.py", line 38, in main
+    ans[pos - 1] = x
+    ~~~^^^^^^^^^
+IndexError: list assignment index out of range,tokens,55608
+LCB_SCORE,3754,medium,PASS,42 tests,tokens,13267
+LCB_SCORE,abc393_b,easy,PASS,43 tests,tokens,465
+LCB_SCORE,3770,hard,PASS,43 tests,tokens,71209
+LCB_SCORE,abc396_c,medium,PASS,43 tests,tokens,6453
+LCB_SCORE,arc190_c,hard,FAIL,capped (no </think>),tokens,81920
+LCB_SCORE,abc400_a,easy,PASS,43 tests,tokens,151
+LCB_SCORE,abc400_e,hard,PASS,5 tests,tokens,37837
+LCB_SCORE,3714,medium,PASS,43 tests,tokens,45582
+LCB_SCORE,abc399_a,easy,PASS,44 tests,tokens,158
+LCB_SCORE,abc391_f,hard,PASS,43 tests,tokens,75862
+LCB_SCORE,abc398_b,medium,PASS,44 tests,tokens,955
+LCB_SCORE,arc194_b,hard,PASS,43 tests,tokens,25106
+LCB_SCORE,abc394_b,easy,PASS,42 tests,tokens,241
+LCB_SCORE,arc193_d,hard,FAIL,capped (no </think>),tokens,81920
+LCB_SCORE,arc194_a,medium,PASS,43 tests,tokens,22320
+LCB_SCORE,abc390_f,hard,PASS,43 tests,tokens,37826
+LCB_SCORE,3753,easy,PASS,33 tests,tokens,1591
+LCB_SCORE,arc195_a,medium,PASS,43 tests,tokens,8660
+LCB_SCORE,abc393_f,hard,PASS,42 tests,tokens,39466
+LCB_TOTAL,pass,35,of,40,pct,87.5,capped,2,easy,10/10,medium,12/12,hard,13/18

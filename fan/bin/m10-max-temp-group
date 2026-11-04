@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+# Print the hottest GPU in one dynamically discovered Tesla M10 PCIe group, in
+# millidegrees Celsius. Each sorted group contains four GPU functions.
+
+set -u
+
+readonly FAILSAFE_MILLIC=255000
+readonly NVIDIA_SMI=/usr/bin/nvidia-smi
+readonly TIMEOUT=/usr/bin/timeout
+readonly FORCE_FAILSAFE=/run/m10-fan-force-failsafe
+
+fail_safe() {
+	printf '%d\n' "$FAILSAFE_MILLIC"
+	exit 0
+}
+
+[[ ! -e $FORCE_FAILSAFE ]] || fail_safe
+[[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || fail_safe
+
+readonly GROUP=$1
+readonly START=$(( GROUP * 4 ))
+readonly END=$(( START + 4 ))
+
+output=$(
+	"$TIMEOUT" --signal=KILL 1.5s "$NVIDIA_SMI" \
+		--query-gpu=pci.bus_id,name,temperature.gpu \
+		--format=csv,noheader,nounits 2>/dev/null
+) || fail_safe
+
+parsed=$(
+	while IFS=, read -r bus name temperature extra; do
+		bus=${bus#"${bus%%[![:space:]]*}"}
+		bus=${bus%"${bus##*[![:space:]]}"}
+		name=${name#"${name%%[![:space:]]*}"}
+		name=${name%"${name##*[![:space:]]}"}
+		temperature=${temperature#"${temperature%%[![:space:]]*}"}
+		temperature=${temperature%"${temperature##*[![:space:]]}"}
+
+		[[ $bus =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] || fail_safe
+		[[ -z $extra ]] || fail_safe
+		[[ $name == 'Tesla M10' ]] || continue
+		[[ $temperature =~ ^[0-9]+$ ]] || fail_safe
+		(( temperature >= 0 && temperature <= 110 )) || fail_safe
+
+		printf '%s %s\n' "$bus" "$temperature"
+	done <<<"$output" | /usr/bin/sort
+) || fail_safe
+
+mapfile -t rows <<<"$parsed"
+readonly DISCOVERED_GPUS=${#rows[@]}
+(( DISCOVERED_GPUS > 0 && DISCOVERED_GPUS % 4 == 0 )) || fail_safe
+(( END <= DISCOVERED_GPUS )) || fail_safe
+
+count=0
+max_temp=-1
+for row in "${rows[@]:START:4}"; do
+	temperature=${row##* }
+	[[ $temperature =~ ^[0-9]+$ ]] || fail_safe
+	(( count += 1 ))
+	(( temperature > max_temp )) && max_temp=$temperature
+done
+
+(( count == 4 && max_temp >= 0 )) || fail_safe
+printf '%d\n' "$(( max_temp * 1000 ))"

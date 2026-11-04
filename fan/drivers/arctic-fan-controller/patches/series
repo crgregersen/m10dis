@@ -1,0 +1,5 @@
+# Quilt patch series for the ARCTIC Fan Controller driver.
+# One patch file name per line, applied top to bottom.
+# This file is the authoritative patch ordering.
+0002_hwmon_arctic_fan_controller_default_pwm_cache_to_mcu_40.patch -p3
+0003_hwmon_arctic_fan_controller_dual_license_gpl_2_0_or_later_or_bsd_2_clause.patch -p3
