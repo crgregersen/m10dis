@@ -141,6 +141,12 @@ struct PeerState {
     NvU32 *device_alias = nullptr;
     void *pex_host_alias = nullptr;
     NvU64 *device_pex_aliases = nullptr;
+    // Outer PEX8748 multicast (Q38_RTX_PEER_PEX_OUTER_BASE, 2026-11-04): one alias group whose writes the outer switch
+    // copies to the six cards' multicast windows; then every request is published once (pub_groups = 1).
+    NvU64 *device_pex_outer_aliases = nullptr;
+    NvU64 pex_outer_base = 0;
+    const NvU64 *pub_aliases = nullptr;
+    NvU32 pub_groups = 6;
     bool pex_multicast = false;
     bool direct_unicast_diagnostic = false;
     bool pex_quiesced = true;
@@ -610,18 +616,24 @@ static void setup_pex_routes(PeerState &s, const char *groups_path,
     // Four logical mailbox windows fit inside one 64-KiB PEX ingress window.
     // Reserve alignment slop and map exactly one 64-KiB requester leaf per
     // switch group, reducing ingress remap records from 24 to 6.
-    const size_t host_bytes = size_t(kPexGroups + 1) * kPexLeafBytes;
+    {const char *ob=std::getenv("Q38_RTX_PEER_PEX_OUTER_BASE");
+     s.pex_outer_base=(ob&&*ob&&!s.direct_unicast_diagnostic)?std::stoull(ob,nullptr,0):0;
+     if(s.pex_outer_base&(kPexLeafBytes-1))throw std::runtime_error("Q38_RTX_PEER_PEX_OUTER_BASE must be 64 KiB aligned");
+     for(const auto &g:groups)if(s.pex_outer_base&&s.pex_outer_base+kPexLeafBytes-1>=g.bridge_lo&&s.pex_outer_base<=g.bridge_hi)
+         throw std::runtime_error("outer multicast window overlaps a card bridge window");}
+    const NvU32 outer_routes = s.pex_outer_base ? 1u : 0u;
+    const size_t host_bytes = size_t(kPexGroups + 1 + outer_routes) * kPexLeafBytes;
     CK(cudaHostAlloc(&s.pex_host_alias, host_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
     void *dev_raw_ptr = nullptr;
     CK(cudaHostGetDevicePointer(&dev_raw_ptr, s.pex_host_alias, 0));
     const NvU64 dev_raw = reinterpret_cast<NvU64>(dev_raw_ptr);
     const NvU64 dev_base = (dev_raw + kPexLeafBytes - 1) & ~(NvU64(kPexLeafBytes) - 1);
     const size_t host_offset = size_t(dev_base - dev_raw);
-    if (host_offset + size_t(kPexGroups) * kPexLeafBytes > host_bytes)
+    if (host_offset + size_t(kPexGroups + outer_routes) * kPexLeafBytes > host_bytes)
         throw std::runtime_error("aligned RTX PEX aliases exceed mapped-host allocation");
     auto *host_base = static_cast<unsigned char *>(s.pex_host_alias) + host_offset;
     auto *dev_base_ptr = reinterpret_cast<void *>(dev_base);
-    const NvU32 route_count = s.direct_unicast_diagnostic ? 1 : kPexGroups;
+    const NvU32 route_count = s.direct_unicast_diagnostic ? 1 : kPexGroups + outer_routes;   // group 6 = outer
     const NvU32 prime_pages = route_count * (kPexLeafBytes / PAGE);
     prime_host_alias<<<1,1>>>(reinterpret_cast<volatile NvU32 *>(dev_base_ptr), prime_pages, 0x38e70000u);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -629,13 +641,14 @@ static void setup_pex_routes(PeerState &s, const char *groups_path,
         if (reinterpret_cast<volatile NvU32 *>(host_base)[size_t(i)*PAGE/4] != 0x38e70000u+i)
             throw std::runtime_error("RTX PEX alias priming check failed at 4-KiB subpage " + std::to_string(i));
 
-    std::vector<NvU64> aliases(kPexAliases);
+    std::vector<NvU64> aliases(kPexAliases), outer_aliases(kPexPagesPerGroup);
     s.pex_routes.reserve(route_count);
     for (NvU32 g=0; g<route_count; ++g) {
         const NvU64 va = dev_base + NvU64(g)*kPexLeafBytes;
-        const NvU64 destination = s.direct_unicast_diagnostic ? s.workers[0].bar_bus : groups[g].ingress;
-        const NvU64 window_lo = groups[s.direct_unicast_diagnostic ? 0 : g].bridge_lo;
-        const NvU64 window_hi = groups[s.direct_unicast_diagnostic ? 0 : g].bridge_hi;
+        const bool outer = g == kPexGroups;
+        const NvU64 destination = s.direct_unicast_diagnostic ? s.workers[0].bar_bus : outer ? s.pex_outer_base : groups[g].ingress;
+        const NvU64 window_lo = outer ? s.pex_outer_base : groups[s.direct_unicast_diagnostic ? 0 : g].bridge_lo;
+        const NvU64 window_hi = outer ? s.pex_outer_base + kPexLeafBytes - 1 : groups[s.direct_unicast_diagnostic ? 0 : g].bridge_hi;
         if (destination < window_lo || destination > window_hi ||
             kPexLeafBytes-1 > window_hi-destination)
             throw std::runtime_error(s.direct_unicast_diagnostic ?
@@ -687,6 +700,9 @@ static void setup_pex_routes(PeerState &s, const char *groups_path,
         if (s.direct_unicast_diagnostic) {
             aliases[0] = va;
         }
+        else if (outer) {
+            for (NvU32 pidx=0; pidx<kPexPagesPerGroup; ++pidx) outer_aliases[pidx]=va+kPexPageOffsets[pidx];
+        }
         else {
             for (NvU32 pidx=0; pidx<kPexPagesPerGroup; ++pidx)
                 aliases[g*kPexPagesPerGroup+pidx]=va+kPexPageOffsets[pidx];
@@ -694,6 +710,13 @@ static void setup_pex_routes(PeerState &s, const char *groups_path,
     }
     CK(cudaMalloc(&s.device_pex_aliases,aliases.size()*sizeof(NvU64)));
     CK(cudaMemcpy(s.device_pex_aliases,aliases.data(),aliases.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
+    s.pub_aliases=s.device_pex_aliases; s.pub_groups=kPexGroups;
+    if (outer_routes) {
+        CK(cudaMalloc(&s.device_pex_outer_aliases,outer_aliases.size()*sizeof(NvU64)));
+        CK(cudaMemcpy(s.device_pex_outer_aliases,outer_aliases.data(),outer_aliases.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
+        s.pub_aliases=s.device_pex_outer_aliases; s.pub_groups=1;
+        std::fprintf(stderr,"RTX_PEX_OUTER_MULTICAST,base,0x%llx,leaves,%u,publish_groups,1\n",(unsigned long long)s.pex_outer_base,kPexRemapsPerGroup);
+    }
     if (s.direct_unicast_diagnostic) {
         s.pex_ingresses.push_back(s.workers[0].bar_bus);
     }
@@ -1387,6 +1410,8 @@ static void cleanup_peer_state(PeerState &s) {
     s.device_return_slots1=nullptr; s.multirow=false; s.mr_max_rows=0;
     if(s.device_m10_return_aliases)cudaFree(s.device_m10_return_aliases);
     if(s.device_pex_aliases)cudaFree(s.device_pex_aliases);
+    if(s.device_pex_outer_aliases)cudaFree(s.device_pex_outer_aliases);
+    s.device_pex_outer_aliases=nullptr; s.pub_aliases=nullptr; s.pub_groups=kPexGroups; s.pex_outer_base=0;
     if(s.host_alias_alloc)cudaFreeHost(s.host_alias_alloc);
     if(s.pex_host_alias)cudaFreeHost(s.pex_host_alias);
     if(s.pex_dma_fd>=0)close(s.pex_dma_fd);
@@ -2176,9 +2201,9 @@ extern "C" int q38_rtx_peer_forward_gpu(uint32_t layer,const void*h,int h_type,c
         const Op::Args a{h,h_type,ids,routes,out};
         pci_cluster_begin<Op><<<1,32,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,layer);
         CK(cudaGetLastError());
-        pci_cluster_publish<Op><<<kPexGroups,256,0,st>>>(s.gpu_dev,a,s.device_pex_aliases,layer);
+        pci_cluster_publish<Op><<<s.pub_groups,256,0,st>>>(s.gpu_dev,a,s.pub_aliases,layer);
         CK(cudaGetLastError());
-        pci_cluster_publish_sequence<<<kPexGroups,1,0,st>>>(s.gpu_dev,s.device_pex_aliases,Op::kMode);
+        pci_cluster_publish_sequence<<<s.pub_groups,1,0,st>>>(s.gpu_dev,s.pub_aliases,Op::kMode);
         CK(cudaGetLastError());
         pci_cluster_wait_combine<Op><<<1,kMoeCombineThreads,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
                                                      s.device_headers,kWaitCycles,2000000000ull);
@@ -2209,9 +2234,9 @@ extern "C" int q38_rtx_peer_moe2_gpu(uint32_t layer,const void*h,int h_type,cons
         const Op::Args a{h,ids,routes,out,rows,s.device_return_slots1,s.gpu_dev,s.gpu_host_dev,layer};
         pci_cluster_begin<Op><<<1,32,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,layer);
         CK(cudaGetLastError());
-        pci_cluster_publish<Op><<<kPexGroups,256,0,st>>>(s.gpu_dev,a,s.device_pex_aliases,layer);
+        pci_cluster_publish<Op><<<s.pub_groups,256,0,st>>>(s.gpu_dev,a,s.pub_aliases,layer);
         CK(cudaGetLastError());
-        pci_cluster_publish_sequence<<<kPexGroups,1,0,st>>>(s.gpu_dev,s.device_pex_aliases,Op::kMode);
+        pci_cluster_publish_sequence<<<s.pub_groups,1,0,st>>>(s.gpu_dev,s.pub_aliases,Op::kMode);
         CK(cudaGetLastError());
         pci_cluster_wait_combine<Op><<<1,kMoeCombineThreads,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
                                                      s.device_headers,kWaitCycles,2000000000ull);
@@ -2386,9 +2411,9 @@ extern "C" int q38_rtx_peer_row_gather_gpu(const long long *rows, uint32_t n, ui
         const Op::Args a{rows, n, out, s.rg_shards, s.rg_nshards, s.rg_desc, s.rg_rank, s.rg_counts, s.gpu_host_dev, kRowGatherLayer};
         pci_cluster_begin<Op><<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, kRowGatherLayer);
         CK(cudaGetLastError());
-        pci_cluster_publish<Op><<<kPexGroups, 128, 0, st>>>(s.gpu_dev, a, s.device_pex_aliases, kRowGatherLayer);
+        pci_cluster_publish<Op><<<s.pub_groups, 128, 0, st>>>(s.gpu_dev, a, s.pub_aliases, kRowGatherLayer);
         CK(cudaGetLastError());
-        pci_cluster_publish_sequence<<<kPexGroups, 1, 0, st>>>(s.gpu_dev, s.device_pex_aliases, Op::kMode);
+        pci_cluster_publish_sequence<<<s.pub_groups, 1, 0, st>>>(s.gpu_dev, s.pub_aliases, Op::kMode);
         CK(cudaGetLastError());
         pci_cluster_wait_combine<Op><<<1, 256, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, s.device_return_slots, 24, kRowGatherLayer,
                                                         s.device_headers, kWaitCycles, 2000000000ull);
@@ -2485,9 +2510,9 @@ extern "C" int q38_rtx_peer_lm_head_topk_rows(const void *x, int x_type, uint16_
                          lse_out, s.gpu_host_dev, kLmLayer, nrows};
         pci_cluster_begin<Op><<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, kLmLayer);
         CK(cudaGetLastError());
-        pci_cluster_publish<Op><<<kPexGroups, 256, 0, st>>>(s.gpu_dev, a, s.device_pex_aliases, kLmLayer);
+        pci_cluster_publish<Op><<<s.pub_groups, 256, 0, st>>>(s.gpu_dev, a, s.pub_aliases, kLmLayer);
         CK(cudaGetLastError());
-        pci_cluster_publish_sequence<<<kPexGroups, 1, 0, st>>>(s.gpu_dev, s.device_pex_aliases, Op::kMode);
+        pci_cluster_publish_sequence<<<s.pub_groups, 1, 0, st>>>(s.gpu_dev, s.pub_aliases, Op::kMode);
         CK(cudaGetLastError());
         pci_cluster_wait_combine<Op><<<1, 1024, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, s.device_return_slots, 24, kLmLayer,
                                                          s.device_headers, kWaitCycles, 2000000000ull);
@@ -2563,9 +2588,9 @@ extern "C" int q38_rtx_peer_moe_batch_gpu(uint32_t layer, const void *h, int h_t
         const Op::Args a{h, h_type, ids, routes, rows, out, s.batch_dev, s.gpu_dev, s.gpu_host_dev, layer};
         pci_cluster_begin<Op><<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, layer);
         CK(cudaGetLastError());
-        pci_cluster_publish<Op><<<kPexGroups, 256, 0, st>>>(s.gpu_dev, a, s.device_pex_aliases, layer);
+        pci_cluster_publish<Op><<<s.pub_groups, 256, 0, st>>>(s.gpu_dev, a, s.pub_aliases, layer);
         CK(cudaGetLastError());
-        pci_cluster_publish_sequence<<<kPexGroups, 1, 0, st>>>(s.gpu_dev, s.device_pex_aliases, Op::kMode);
+        pci_cluster_publish_sequence<<<s.pub_groups, 1, 0, st>>>(s.gpu_dev, s.pub_aliases, Op::kMode);
         CK(cudaGetLastError());
         pci_cluster_wait_combine<Op><<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, s.device_return_slots, 24, layer,
                                                        s.device_headers, kWaitCycles, 2000000000ull);
@@ -2672,7 +2697,7 @@ extern "C" int q38_rtx_peer_moe_batch_pipe_gpu(uint32_t layer, const void *h, in
         auto publish = [&](uint32_t c) {
             q38_pipe_publish<<<kPexGroups, 256, 0, st>>>(s.gpu_dev, args(c));
             CK(cudaGetLastError());
-            q38_pipe_doorbell<<<kPexGroups, 1, 0, st>>>(s.gpu_dev, s.gpu_host_dev, s.device_pex_aliases, c);
+            q38_pipe_doorbell<<<s.pub_groups, 1, 0, st>>>(s.gpu_dev, s.gpu_host_dev, s.pub_aliases, c);
             CK(cudaGetLastError());
         };
         q38_pipe_begin<<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, layer, n);

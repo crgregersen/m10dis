@@ -34,10 +34,12 @@ All numbers come from runs on the test machine (2026-11-02 to 2026-11-04). Every
 
 | Draft tokens | Natural long-form prompt (`prompts/mtp_eval_prompt.txt`) | Humaneval prompt, `ignore_eos` |
 |---|---|---|
-| 0 | 53.4 tok/s | 51.8 tok/s |
-| 1 | **65.6** (70 % accepted, 1.70 tokens per step) | 69.4 (89 %) |
-| 2 | 65.4 (70 / 66 % per position) | 82.6 (97 / 97 %) |
-| 3 | 60.1 (67 / 67 / 56 %) | **89.6** (97 / 99 / 96 %) |
+| 0 | 53.4 tok/s (54.9 with the outer multicast group) | 51.8 tok/s |
+| 1 | **65.6** (70 % accepted, 1.70 tokens per step); **67.8** with the outer group | 69.4 (89 %) |
+| 2 | 65.4 (70 / 66 % per position); 68.0 with the outer group | 82.6 (97 / 97 %) |
+| 3 | 60.1 (67 / 67 / 56 %) | **89.6** (97 / 99 / 96 %); **93.7** with the outer group |
+
+The outer group (`Q38_RTX_PEER_PEX_OUTER=1`, [TRANSPORT.md](TRANSPORT.md#8-optional-one-outer-multicast-group-q38_rtx_peer_pex_outer1)) publishes each request once instead of six times: 16.4 → 7.2 µs per MoE layer for one row, 45.1 → 11.3 µs for four, with identical results.
 
 The humaneval column overstates acceptance: with `ignore_eos` the model keeps going after its answer, and that continuation repeats. The best draft length is lower than on a single GPU, because every verify row costs M10 time: one multi-row exchange takes 150 / 239 / 337 / 432 µs per layer for 1 / 2 / 3 / 4 rows (bandwidth-bound: each row reads its own experts). Suggested: 2 draft tokens by default, 3 for code-heavy work. The MTP layer's attention KV costs about 21 % of the KV pool (66,628 instead of 84,440 tokens at 2.5 GiB).
 

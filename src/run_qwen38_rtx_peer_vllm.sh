@@ -83,12 +83,15 @@ PY
 }
 worker_seq "$RUN/worker-seq-before.json"
 capture_mc() {
-python3 - "$TOPOLOGY" "$1" "$REPO/src" <<'PY'
+python3 - "$TOPOLOGY" "$1" "$REPO/src" "$Q38_RTX_BDF" <<'PY'
 import json, sys
 sys.path.insert(0, sys.argv[3]); import pex_group_config as p
 rows = [l.split('\t') for l in open(sys.argv[1]).read().splitlines() if l]; out = {}
 for r in rows:
     for b in [r[1]] + r[2].split(','): out[b] = {k: hex(x) for k, x in p.regs(b).items()}
+# outer PEX8748 ports too (2026-11-04: the optional outer multicast group must be restored exactly)
+o = p.outer_discover(sys.argv[1], sys.argv[4])
+for b in [o['upstream'], o['rtx_port'], o['empty_port'], *o['card_ports']]: out[b] = {k: hex(x) for k, x in p.regs(b, 0x8748).items()}
 json.dump(out, open(sys.argv[2], 'w'), indent=1)
 print('MC_REGISTERS,ports', len(out))
 PY

@@ -294,7 +294,9 @@ def _q38_batch_timing(worker=None) -> dict:
             inner.check_error()
             return cs
         ref = run("per_row", 1)[0]
-        rep = {"passes": stress, "rows": R}
+        # reference checksum of all 48 layers' outputs (seeded inputs, bit-reproducible M10 path): equal across runs and
+        # transports (e.g. with and without the outer PEX8748 multicast group, 2026-11-04)
+        rep = {"passes": stress, "rows": R, "ref_checksum": int(ref.sum().item()) & 0xFFFFFFFFFFFF}
         for path in stress_paths:
             t0 = _t.perf_counter()
             bad = (run(path, stress) != ref.unsqueeze(0)).nonzero().tolist()     # [pass, layer, row]
@@ -421,6 +423,7 @@ def _q38_lm2_check(worker=None) -> dict:
                 b = inner.lm_head_logits(x); lb = inner.last_lm_lse.clone()
                 _torch.cuda.synchronize(); t2.append(_t.perf_counter() - t0)
                 res["bad_lse"] += int((la.view(_torch.int32) != lb.view(_torch.int32)).sum())
+                res["lse_checksum"] = (res.get("lse_checksum", 0) + int(la.view(_torch.int32).to(_torch.int64).sum().item())) & 0xFFFFFFFFFFFF
                 fin = _torch.isfinite(b.float())
                 res["bad_logits"] += int(((a.view(_torch.int16) != b.view(_torch.int16)) & fin).any(dim=1).sum())
                 res["argmax_bad"] += int((a.float().argmax(1) != b.float().argmax(1)).sum())

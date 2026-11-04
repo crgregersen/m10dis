@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Bounded, snapshot-backed configuration for one M10-local PEX8747 group."""
+"""Bounded, snapshot-backed multicast configuration: one M10-local PEX8747 group, or (outer-*, 2026-11-04)
+one outer PEX8748 group that copies an RTX write to the six cards' own multicast windows."""
 from __future__ import annotations
 import argparse, json, os, pathlib, re, struct, subprocess, sys
 
@@ -41,9 +42,9 @@ def mc_cap(b):
  if len(found)!=1: raise RuntimeError(f'{b}: multicast extended capability found {len(found)} times ({[hex(x) for x in found]})')
  _mc_cache[b]=found[0]; return found[0]
 def mc(b,rel): return mc_cap(b)+rel
-def regs(b):
+def regs(b,device=0x8747):
  ident=read(b,0,4)
- if struct.unpack('<HH',ident)!=(0x10b5,0x8747): raise RuntimeError(f'{b}: not PEX8747')
+ if struct.unpack('<HH',ident)!=(0x10b5,device): raise RuntimeError(f'{b}: not PEX{device:x}')
  if r32(b,mc(b,0))&0xffff!=MC_CAP_ID: raise RuntimeError(f'{b}: multicast capability header changed')
  return {'control':r16(b,mc(b,CTRL)),'base':r64(b,mc(b,BASE)),'receive':r64(b,mc(b,RECEIVE)),
          'block':r64(b,mc(b,BLOCK)),'block_untranslated':r64(b,mc(b,BLOCK_UNTRANS)),
@@ -67,7 +68,8 @@ def collision_check(base):
   except FileNotFoundError: pass
 def load_snapshot(d): return json.loads((d/'snapshot.json').read_text())
 def restore(d):
- snap=load_snapshot(d)
+ snap=load_snapshot(d); dev=snap.get('device',0x8747)
+ regs_=lambda b: regs(b,dev)
  for b in snap['ports']: w16(b,mc(b,CTRL),snap['regs'][b]['control']&~ENABLE)
  for b in snap['ports']:
   v=snap['regs'][b]
@@ -75,16 +77,96 @@ def restore(d):
                   (BLOCK_UNTRANS,'block_untranslated'),(OVERLAY,'overlay')): w64(b,mc(b,off),v[key])
  for b in snap['ports']: w16(b,mc(b,CTRL),snap['regs'][b]['control'])
  for b in snap['ports']:
-  now=regs(b)
+  now=regs_(b)
   if now!=snap['regs'][b]: raise RuntimeError(f'{b}: exact restore mismatch {now} != {snap["regs"][b]}')
  print('RESTORE,PASS')
+# ---- outer PEX8748 group (2026-11-04) -------------------------------------------------------
+# Ingress: the RTX's downstream port (base + enable, no receive). Egress: the six card ports (receive group 0,
+# overlay = that card's own multicast window from topology.tsv, so the copy lands in the card's window and the
+# card's PEX8747 copies it to its four GPUs). Window: the first 64 KiB of the prefetchable window of a downstream
+# port with no device behind it (unused address space that the switch already routes); every other port's window
+# and every endpoint resource must stay clear of it. Everything is discovered from sysfs.
+def _children(b): return [p.name for p in pathlib.Path(os.path.realpath(SYS/b)).iterdir() if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]',p.name)]
+def outer_discover(topology,rtx):
+ rtx_port=pathlib.Path(os.path.realpath(SYS/rtx)).parent.name
+ up=pathlib.Path(os.path.realpath(SYS/rtx_port)).parent.name
+ rows=[l.split('\t') for l in pathlib.Path(topology).read_text().splitlines() if l]
+ cards=[];bases=[]
+ for r in rows:
+  port=pathlib.Path(os.path.realpath(SYS/r[1])).parent.name
+  if pathlib.Path(os.path.realpath(SYS/port)).parent.name!=up: raise RuntimeError(f'card {r[1]} is not below outer switch {up}')
+  cards.append(port);bases.append(int(r[6],16))
+ ds=[n for n in _children(up)]
+ for b in [up]+ds:
+  if struct.unpack('<HH',read(b,0,4))!=(0x10b5,0x8748): raise RuntimeError(f'{b}: not PEX8748')
+ empty=[b for b in ds if b!=rtx_port and b not in cards and not _children(b)]
+ if not empty: raise RuntimeError('no empty downstream port with a window for the outer multicast group')
+ lo,hi=window(empty[0]); base=(lo+WINDOW-1)&~(WINDOW-1)
+ if base+WINDOW-1>hi: raise RuntimeError(f'{empty[0]}: window too small')
+ for b in ds:
+  if b==empty[0]: continue
+  try: wlo,whi=window(b)
+  except RuntimeError: continue
+  if wlo<=base+WINDOW-1 and whi>=base: raise RuntimeError(f'outer window overlaps {b} window')
+ collision_check(base)
+ return {'upstream':up,'rtx_port':rtx_port,'card_ports':cards,'card_mc_bases':bases,'empty_port':empty[0],'base':base}
+def outer_capture(d,topology,rtx):
+ info=outer_discover(topology,rtx);ports=[info['rtx_port'],*info['card_ports']]
+ reg={b:regs(b,0x8748) for b in ports}
+ if any(v['control']&ENABLE for v in reg.values()): raise RuntimeError('outer multicast was already enabled')
+ d.mkdir(parents=True,exist_ok=False)
+ for b in ports:(d/(b.replace(':','_')+'.config')).write_bytes(read(b,0,4096))
+ (d/'snapshot.json').write_text(json.dumps({'device':0x8748,'ports':ports,'regs':reg,'outer':info},indent=2)+'\n')
+ print('OUTER_CAPTURE,PASS,ports,',','.join(ports),'base,',hex(info['base']),'empty_port,',info['empty_port'])
+def outer_apply(d):
+ snap=load_snapshot(d);info=snap['outer'];ports=snap['ports'];base=info['base']
+ if base%WINDOW: raise RuntimeError('outer base must be 64 KiB aligned')
+ collision_check(base)
+ planned={}
+ for i,b in enumerate(ports):
+  old=snap['regs'][b]
+  if regs(b,0x8748)!=old: raise RuntimeError(f'{b}: changed since snapshot')
+  if i==0: recv=overlay=0
+  else:
+   mb=info['card_mc_bases'][i-1]
+   if mb%WINDOW: raise RuntimeError(f'card multicast base {mb:#x} not 64 KiB aligned')
+   recv=1;overlay=mb|INDEX
+  planned[b]={'control_disabled':old['control']&~ENABLE,'control_enabled':(old['control']&~0x803f)|ENABLE,
+   'base':base|INDEX,'receive':recv,'overlay':overlay,'block':old['block'],'block_untranslated':old['block_untranslated']}
+ (d/'plan.json').write_text(json.dumps({'base':base,'window':WINDOW,'ports':planned},indent=2)+'\n')
+ changed=False
+ try:
+  for b in ports:w16(b,mc(b,CTRL),planned[b]['control_disabled'])
+  changed=True
+  for b in ports:
+   v=planned[b]
+   for off,key in ((BASE,'base'),(RECEIVE,'receive'),(OVERLAY,'overlay')):w64(b,mc(b,off),v[key])
+  for b in ports:
+   now=regs(b,0x8748);v=planned[b]
+   if any(now[k]!=v[k] for k in ('base','receive','overlay','block','block_untranslated')) or now['control']!=v['control_disabled']:
+    raise RuntimeError(f'{b}: disabled-state readback mismatch')
+  for b in ports[1:]:w16(b,mc(b,CTRL),planned[b]['control_enabled'])   # egress first, then the RTX ingress
+  w16(ports[0],mc(ports[0],CTRL),planned[ports[0]]['control_enabled'])
+  for b in ports:
+   if regs(b,0x8748)['control']!=planned[b]['control_enabled']: raise RuntimeError(f'{b}: enable readback mismatch')
+  print('OUTER_APPLY,PASS,base,',hex(base))
+ except Exception:
+  if changed: restore(d)
+  raise
+
 def main():
  ap=argparse.ArgumentParser(); sub=ap.add_subparsers(dest='op',required=True)
  c=sub.add_parser('capture');c.add_argument('--snapshot',type=pathlib.Path,required=True);c.add_argument('--upstream',required=True);c.add_argument('--ports',nargs=4,required=True);c.add_argument('--gpus',nargs=4,required=True)
  a=sub.add_parser('apply');a.add_argument('--snapshot',type=pathlib.Path,required=True);a.add_argument('--base',type=lambda x:int(x,0),required=True);a.add_argument('--map-bus',nargs=4,type=lambda x:int(x,0),required=True)
  r=sub.add_parser('restore');r.add_argument('--snapshot',type=pathlib.Path,required=True)
+ oc=sub.add_parser('outer-capture');oc.add_argument('--snapshot',type=pathlib.Path,required=True);oc.add_argument('--topology',required=True);oc.add_argument('--rtx',required=True)
+ oa=sub.add_parser('outer-apply');oa.add_argument('--snapshot',type=pathlib.Path,required=True)
+ od=sub.add_parser('outer-discover');od.add_argument('--topology',required=True);od.add_argument('--rtx',required=True)
  args=ap.parse_args()
  if os.geteuid()!=0: raise RuntimeError('must run as root')
+ if args.op=='outer-discover': print(json.dumps({k:(hex(v) if isinstance(v,int) else v) for k,v in outer_discover(args.topology,args.rtx).items()})); return
+ if args.op=='outer-capture': outer_capture(args.snapshot,args.topology,args.rtx); return
+ if args.op=='outer-apply': outer_apply(args.snapshot); return
  if args.op=='capture':
   d=args.snapshot;d.mkdir(parents=True,exist_ok=False);ports=[args.upstream,*args.ports]
   reg={b:regs(b) for b in ports}

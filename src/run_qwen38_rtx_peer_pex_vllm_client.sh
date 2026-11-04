@@ -68,6 +68,26 @@ make -C "$ROOT/transport/rtx_mc_dma" KDIR="/lib/modules/$(uname -r)/build" clean
 cp "$KO_SRC" "$OUT/rtx_mc_dma_map.ko"; sha256sum "$KO_SRC" > "$OUT/module.sha256"
 insmod "$KO_SRC" "requester_bdf=$Q38_RTX_BDF" "groups=6" "ingress=${F[0]}" "branch_start=${F[1]}" "branch_end=${F[2]}"
 echo "PEX_DMA_HELPER_LOADED,$Q38_RTX_BDF,groups,6"
+# Optional outer PEX8748 multicast group (Q38_RTX_PEER_PEX_OUTER=1, 2026-11-04): the RTX publishes each request once
+# into a 64 KiB window in the empty port's address range; the outer switch copies it to the six cards' own multicast
+# windows. Captured and applied here (pex_group_config.py outer-*), restored right after the client exits and on any
+# earlier exit (a stale RTX write to the window then goes to the empty port and is dropped).
+OUTER_SNAP=
+outer_restore() {
+  if [[ -n $OUTER_SNAP && -e $OUTER_SNAP/snapshot.json && ! -e $OUTER_SNAP/restored ]]; then
+    if python3 "$ROOT/src/pex_group_config.py" restore --snapshot "$OUTER_SNAP"; then touch "$OUTER_SNAP/restored"; echo "OUTER_MC_RESTORE,PASS"
+    else echo "OUTER_MC_RESTORE,FAIL,snapshot,$OUTER_SNAP"; fi
+  fi
+}
+if [[ ${Q38_RTX_PEER_PEX_OUTER:-0} == 1 ]]; then
+  OUTER_SNAP="$OUT/outer-mc"
+  trap outer_restore EXIT
+  python3 "$ROOT/src/pex_group_config.py" outer-capture --snapshot "$OUTER_SNAP" --topology "$GROUPS_TSV" --rtx "$Q38_RTX_BDF"
+  python3 "$ROOT/src/pex_group_config.py" outer-apply --snapshot "$OUTER_SNAP"
+  Q38_RTX_PEER_PEX_OUTER_BASE=$(python3 -c 'import json,sys;print(hex(json.load(open(sys.argv[1]))["outer"]["base"]))' "$OUTER_SNAP/snapshot.json")
+  export Q38_RTX_PEER_PEX_OUTER_BASE
+  echo "OUTER_MC_ACTIVE,base,$Q38_RTX_PEER_PEX_OUTER_BASE"
+fi
 dmesg --ctime > "$OUT/dmesg-before.txt"
 
 # Clock sampler on all 25 GPUs for the whole vLLM lifetime (500 ms).
@@ -163,6 +183,7 @@ kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true
 # its cleanup proof and left ACS + the DMA helper in place).
 if [[ -n $PYSPY_PID ]]; then kill "$PYSPY_PID" 2>/dev/null || true; wait "$PYSPY_PID" 2>/dev/null || true; cat "$OUT/pyspy-runner.log" 2>/dev/null || true; fi
 echo "VLLM_CLIENT_EXIT,$client_rc"
+outer_restore
 tail -5 "$OUT/client.log"
 
 # Cleanup proof: the client result is PASS without cleanup errors, the adapter wrote its

@@ -83,6 +83,11 @@ Batched modes would need about 1.3 · R remapped pages per returning worker, so 
 
 Batched outputs are bit-identical to the single-row path, because the summation orders are the same.
 
-## 8. Why the M10s don't share one big multicast
+## 8. Optional: one outer multicast group (`Q38_RTX_PEER_PEX_OUTER=1`)
 
-The outer PEX8748 also supports multicast, but m10dis uses only the per-card groups. A decode request costs the RTX six copies of a few KB, which is small next to the round trip. An outer group spanning all six cards stays an untested option, mainly for the host-read fan-out in prefill (24 GPUs reading the same rows from host memory).
+The outer PEX8748 has the same Multicast capability. With `Q38_RTX_PEER_PEX_OUTER=1` the client wrapper configures one outer group for the session (`pex_group_config.py outer-capture` / `outer-apply`, restored right after the client exits and on any earlier exit):
+
+- window: the first 64 KiB of the bridge window of a downstream port with nothing behind it (the empty slot), found from sysfs; a misrouted write there goes to the empty port and is dropped;
+- ingress: the RTX's downstream port; egress: the six card ports, each with an overlay onto that card's own multicast window, so the card's PEX8747 then copies the write to its four GPUs.
+
+The RTX then publishes each request once (7 more 4-KiB leaves instead of 6 × 7 writes). Publish per MoE layer: 16.4 → 7.2 µs for one row, 45.1 → 11.3 µs for four. The runner's before/after register check covers the 9 outer ports too; results are bit-identical with and without it (same checksums of all 48 layers' outputs). The prefill host-read fan-out (24 GPUs reading the same rows from host memory) is still untouched.

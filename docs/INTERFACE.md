@@ -174,6 +174,7 @@ Tests: `src/run_pci_cluster_row_gather_test.sh` (both worker kernels on the RTX 
 | `Q38_RTX_PEER_MOE_MULTIROW=1`, `Q38_RTX_PEER_MOE_MULTIROW_MAX` (2..4, default 2) | MoE calls of 2..max rows go as one mode-10 exchange (MTP verify) instead of mode 1 per row or mode 8 |
 | `Q38_M10_LM_HEAD_ROWS2=1` | LM-head calls of 2..4 BF16 rows go as one mode-7 exchange (`reserved` = N; K capped at (2560 − N) // N − 1, e.g. 638 for 4 rows) |
 | `Q38_DAEMON_LAYERS` (daemon start, 48 or 49) | 49 also loads the MTP layer's experts and shared expert as layer 48 (bundle `layer_48`, `src/prepare_mtp_layer_bundle.py`) |
+| `Q38_RTX_PEER_PEX_OUTER=1` | Outer PEX8748 multicast group for the session ([TRANSPORT.md](TRANSPORT.md#8-optional-one-outer-multicast-group-q38_rtx_peer_pex_outer1)); the library gets the window as `Q38_RTX_PEER_PEX_OUTER_BASE` and publishes every request once |
 | `Q38_VLLM_IGNORE_EOS=1` | Generation mode always produces `--max-new-tokens` (equal-length speed comparisons) |
 | `Q38_NSYS=1`, `Q38_CUDA_PROFILER_START_TOKENS`, `Q38_CUDA_PROFILER_TOKENS` | Run the client under `nsys profile --capture-range=cudaProfilerApi`; the adapter opens the range at that decode step for that many steps |
 | `Q38_PYSPY_SECONDS` | Non-blocking py-spy record of the engine during steady decode |
