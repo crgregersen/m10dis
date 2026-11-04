@@ -69,6 +69,10 @@ Commands and state: [INTERFACE.md](INTERFACE.md).
 
 At about 150 µs per layer, the 48 MoE layers take about 7.4 ms of the 19 ms decode step. The rest is the RTX's own layers and the LM-head exchange.
 
+## MTP (speculative decoding)
+
+The checkpoint's single MTP layer drafts tokens (vLLM `method=mtp`, `Q38_MTP_SPEC_TOKENS`). Its 512 experts and shared expert are sliced exactly like a model layer and resident on the M10s as **layer 48** (49-layer daemon, about 127 MiB more per routed GPU); its attention, fc and hyper-connection weights are on the RTX, its embedding and LM head are the target's (host table, M10 LM head). The verify step runs k + 1 rows through every layer: the MoE as one **mode-10** exchange of up to 4 rows (same transport as mode 1, more pages per route; bit-identical per row) and the LM head as one N-row mode-7 exchange. See [RESULTS.md](RESULTS.md#mtp-speculative-decoding).
+
 ## Prefill
 
 One row per exchange would make prefill as slow as decode: about 51 tok/s at the start of the project. Prefill therefore uses **batched exchanges** (worker modes 8 and 9):

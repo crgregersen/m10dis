@@ -15,6 +15,7 @@ Every file in `src/`, grouped by role. `src/` is flat because the runners and th
 | `run_qwen38_rtx_peer_pex_vllm_client.sh` | inner step: DMA helper module, preload, the vLLM client |
 | `run_qwen38_moe_batch_integration.sh` | the 4k-token prompt through vLLM once per requested mode (per row / batched / pipelined) |
 | `run_qwen38_bench.sh` | benchmark run with the frozen serving configuration |
+| `run_qwen38_decode_profile.sh` | decode profile / speed run with the frozen configuration: graph ceiling + per-exchange breakdown, optional py-spy and nsys, MTP and multi-row settings pass through |
 | `run_bench_score_v2.sh` | scores the newest benchmark run (CPU) |
 | `run_qwen38_rtx_pex_multicast.sh` | standalone check of CPU vs RTX publication into the six multicast windows |
 
@@ -57,6 +58,7 @@ Every file in `src/`, grouped by role. `src/` is flat because the runners and th
 | `resident_multicast_mapping.cuh`, `resident_pdb_export.cuh`, `resident_pack_down_kernel.cuh` | BAR1 mapping, VA-space identity export, down-projection packing |
 | `cuda_load_stage9_ple.cu`, `qwen38_parallel_load.cuh` | PLE owner: n-gram shards and LM-head slices, parallel verified loading, CUDA IPC export |
 | `qwen38_m10_expert_sim.py` | layer streaming and packing helpers used by the daemon |
+| `resident_multirow_abi.cuh` | layout of the multi-row decode MoE (mode 10, up to 4 rows) and the per-worker multi-row block |
 | `pex_group_config.py` | programs, checks and restores the PEX8747 multicast registers |
 | `check_qwen38_mc_premap.py` | read-only multicast check before the daemon starts |
 | `q38_peer_route_tool.cu`, `qwen38_route_journal.h` | route records: journal, inspection, restore |
@@ -72,6 +74,7 @@ Every file in `src/`, grouped by role. `src/` is flat because the runners and th
 | `prepare_resident_expert_layer.py`, `run_stage7_full_residency.py`, `preserve_stage7_bundles.py`, `capture_stage7_manifests.py`, `combine_stage7_ranges.py` | expert-slice bundles |
 | `prepare_stage9_ple_manifest.py`, `extract_qwen38_ple_shards.py`, `cuda_stage9_placement_capacity.cu` | n-gram table placement and shards |
 | `build_qwen38_lm_head_raw.py` | raw LM-head file for the M10 slices |
+| `prepare_mtp_layer_bundle.py` | packs the MTP layer's experts and shared expert as resident layer 48 |
 
 ## Benchmarks and analysis
 

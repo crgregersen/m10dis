@@ -15,6 +15,9 @@
 set -Eeuo pipefail
 ulimit -c 0
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/m10dis_env.sh"
+# Q38_DAEMON_LAYERS (2026-11-04): 48 model layers, or 49 = also the MTP layer's experts as layer 48
+NL=${Q38_DAEMON_LAYERS:-48}
+[[ $NL == 48 || $NL == 49 ]] || { echo "ERROR,Q38_DAEMON_LAYERS must be 48 or 49"; exit 2; }
 ROOT=$M10DIS_HOME
 REPO=$M10DIS_HOME
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -203,6 +206,7 @@ setsid env \
     --direct-library "$RUN/build/libqwen38_direct_moe.so" \
     --direct-groups "$TOPOLOGY" \
     --peer-route-tool "$RUN/build/q38_peer_route_tool" \
+    --layer-count "$NL" \
     >"$RUN/daemon.log" 2>&1 < /dev/null &
 echo "$!" > "$RUN/launcher_pid.txt"
 state=; prev=
@@ -222,11 +226,12 @@ done
 t1=$(date +%s.%N)
 echo "DAEMON_LOAD_SECONDS,$(python3 -c "print(f'{$t1-$t0:.1f}')")"
 $DAEMON status --control-socket "$RUNTIME/control.sock" > "$RUN/daemon-status-ready.json"
-python3 - "$RUN/daemon-status-ready.json" <<'PY'
-import json, sys
+NL="$NL" python3 - "$RUN/daemon-status-ready.json" <<'PY'
+import json, os, sys
+NL = int(os.environ["NL"])
 x = json.load(open(sys.argv[1]))
-assert x.get('status') == 'READY' and x.get('layers_ready') == 48, x.get('layers_ready')
-assert x.get('loaded_layer_ids') == list(range(48))
+assert x.get('status') == 'READY' and x.get('layers_ready') == NL, x.get('layers_ready')
+assert x.get('loaded_layer_ids') == list(range(NL))
 assert x.get('direct_moe_setup', {}).get('status') == 'PASS'
 assert x.get('direct_moe_setup', {}).get('gpu_map_records') == 24
 print('DAEMON_READY', x.get('pid'), 'layers', x.get('layers_ready'), 'expert_load_seconds', x.get('expert_load_seconds'))
@@ -279,15 +284,16 @@ $DAEMON reload-kernels --control-socket "$RUNTIME/control.sock" --routed-image "
 python3 -c "import json,sys;r=json.load(open(sys.argv[1]));assert r.get('status')=='ok',r;print('RELOAD_KERNELS,ok,routed_v3,shared_v2')" "$RUN/reload-kernels.json" \
   || { echo 'ERROR,kernel reload failed; daemon left running with its built-in kernels'; exit 10; }
 $DAEMON status --control-socket "$RUNTIME/control.sock" > "$RUN/daemon-status-parked.json"
-python3 - "$RUN/daemon-status-parked.json" "$RUN/build/routed_v3.cubin" <<'PY'
-import json, sys
+NL="$NL" python3 - "$RUN/daemon-status-parked.json" "$RUN/build/routed_v3.cubin" <<'PY'
+import json, os, sys
+NL = int(os.environ["NL"])
 x = json.load(open(sys.argv[1]))
-assert x.get('status') == 'READY' and x.get('layers_ready') == 48, x
+assert x.get('status') == 'READY' and x.get('layers_ready') == NL, x
 assert x.get('worker_activity') == 'PARKED', x.get('worker_activity')
 kr = x.get('kernel_reload') or {}
 print('KERNEL_RELOAD_STATE', json.dumps(kr)[:400])
 assert sys.argv[2] in json.dumps(kr), 'status does not record the v3 routed image'
-print('DAEMON_PARKED_READY', x.get('pid'), 'layers', 48, 'workers', 'PARKED')
+print('DAEMON_PARKED_READY', x.get('pid'), 'layers', NL, 'workers', 'PARKED')
 PY
 
 cat > "$RUN/daemon.env" <<EOF

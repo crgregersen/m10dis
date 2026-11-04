@@ -40,7 +40,7 @@ What it does, in order:
 2. Builds from the current source into the run folder: worker services, worker cubins (routed v3, shared v2), the PLE owner, the route tool, the direct-MoE library and the write-combining helper module. Every hash goes into `build-hashes.sha256`.
 3. Checks the multicast registers of all six cards before the session (`MC_PREMAP_OK`).
 4. Starts `qwen38_resident_daemon.py serve`. It loads the n-gram shards and LM-head slices through the PLE owner, then the 48 layers of expert slices onto the 24 GPUs, and verifies them.
-5. Waits for `READY`, 48 layers, workers `PARKED`. It then writes `daemon.env` (sockets, manifest, topology, snapshot root) and links it as `$M10DIS_RUNS/qwen38-full-daemon/latest`.
+5. Waits for `READY`, 48 layers (49 with `Q38_DAEMON_LAYERS=49`, which also loads the MTP layer as layer 48 for MTP runs), workers `PARKED`. It then writes `daemon.env` (sockets, manifest, topology, snapshot root) and links it as `$M10DIS_RUNS/qwen38-full-daemon/latest`.
 
 Loading takes several minutes. The daemon then stays up across any number of clients.
 

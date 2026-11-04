@@ -150,7 +150,7 @@ int main(){
    }catch(const std::exception&e){fprintf(stderr,"ROUTED_KERNEL_RELOAD_ERROR,%s\n",e.what());printf("{\"status\":\"error\",\"code\":\"KERNEL_RELOAD_FAILED\",\"message\":\"%s\"}\n",e.what());if(quiesce_attempted){fflush(stdout);fprintf(stderr,"reload could not prove a clean restart; retaining CUDA resources\n");for(;;)std::this_thread::sleep_for(std::chrono::minutes(1));}}continue;
   }
   if(cmd=="LOAD"){
-   std::string dir;in>>layer>>dir;if(started){printf("{\"status\":\"error\",\"code\":\"LOAD_AFTER_START\"}\n");continue;}if(layer<0||layer>=48){emit_error("load","INVALID_LAYER",layer);continue;}
+   std::string dir;in>>layer>>dir;if(started){printf("{\"status\":\"error\",\"code\":\"LOAD_AFTER_START\"}\n");continue;}if(layer<0||layer>=49){emit_error("load","INVALID_LAYER",layer);continue;}
    if(states[layer]=="READY"){printf("{\"status\":\"ok\",\"code\":\"LAYER_READY\",\"layer_id\":%d,\"already_ready\":true}\n",layer);continue;}
    states[layer]="LOADING";g_file_read_s=0;g_cpu_pack_s=0;g_cuda_upload_s=0;fflush(stdout);
    if(!valid_bundle(layer,dir)){states[layer]="ERROR";printf("{\"status\":\"error\",\"code\":\"LAYER_LOAD_FAILED\",\"layer_id\":%d,\"reason\":\"bundle_missing_or_manifest_mismatch\"}\n",layer);continue;}
@@ -195,16 +195,16 @@ int main(){
    }
    if(ok){resident[layer]=std::move(layerw);states[layer]="READY";printf("{\"status\":\"ok\",\"code\":\"LAYER_READY\",\"layer_id\":%d,\"file_read_seconds\":%.6f,\"cpu_pack_seconds\":%.6f,\"cuda_alloc_copy_seconds\":%.6f,\"load_mode\":\"%s\",\"load_wall_seconds\":%.6f}\n",layer,g_file_read_s,g_cpu_pack_s,g_cuda_upload_s,parallel_load?"parallel_per_card":"serial",load_wall_s);}else{states[layer]="ERROR";emit_error("load","LAYER_LOAD_FAILED",layer);}continue;
   }
-  if(cmd=="STATUS"){in>>layer;if(layer<0||layer>=48){emit_error("status","INVALID_LAYER",layer);continue;}const char*s=states.count(layer)?states[layer].c_str():"NOT_LOADED";printf("{\"status\":\"ok\",\"layer_id\":%d,\"layer_state\":\"%s\"}\n",layer,s);continue;}
+  if(cmd=="STATUS"){in>>layer;if(layer<0||layer>=49){emit_error("status","INVALID_LAYER",layer);continue;}const char*s=states.count(layer)?states[layer].c_str():"NOT_LOADED";printf("{\"status\":\"ok\",\"layer_id\":%d,\"layer_state\":\"%s\"}\n",layer,s);continue;}
   if(cmd=="INFER"){
    std::string reqpath,outpath,partpath;in>>id>>layer>>reqpath>>outpath>>partpath;
-   if(layer<0||layer>=48){emit_error(id,"INVALID_LAYER",layer);continue;}
+   if(layer<0||layer>=49){emit_error(id,"INVALID_LAYER",layer);continue;}
    if(!states.count(layer)||states[layer]=="NOT_LOADED"||states[layer]=="LOADING"){emit_error(id,"LAYER_NOT_READY",layer);continue;}
    if(states[layer]=="ERROR"){emit_error(id,"LAYER_LOAD_FAILED",layer);continue;}
    try{std::lock_guard<std::mutex> command_guard(command_mutex);if(heartbeat_failed)throw std::runtime_error("heartbeat failure");auto bytes=std::filesystem::file_size(reqpath);if(bytes!=sizeof(uint32_t)+size_t(H)*sizeof(float)+size_t(K)*sizeof(int32_t)+size_t(K)*sizeof(float))throw std::runtime_error("request byte length mismatch: "+std::to_string(bytes));std::ifstream f(reqpath,std::ios::binary);if(!f)throw std::runtime_error("request file open failed: "+reqpath);Request r=read_request(f);if(r.layer!=layer)throw std::runtime_error("request layer mismatch");for(int k=0;k<K;k++)if(r.ids[k]<0||r.ids[k]>=E||!std::isfinite(r.routes[k]))throw std::runtime_error("invalid expert ID or route");for(float x:r.x)if(!std::isfinite(x))throw std::runtime_error("invalid input");std::vector<float>parts(size_t(count)*H),out(H,0.0f);
     if(!started){
      for(int d=0;d<count;d++){
-      CK(cudaSetDevice(d)); auto &v=dynamic[d]; import_ple_table(v,unsigned(d),ple_devices); std::vector<DeviceWeights>table(48);
+      CK(cudaSetDevice(d)); auto &v=dynamic[d]; import_ple_table(v,unsigned(d),ple_devices); std::vector<DeviceWeights>table(49);
       for(auto &entry:resident) table[entry.first]=entry.second[d]; v.table=upload(table);
       auto get=reinterpret_cast<ExportGetterQ>(dlsym(RTLD_DEFAULT,"rm_trace_get_last_export"));if(!get)throw std::runtime_error("RM trace preload missing");
       qcreate_mapping(qmem[d],groups[d/4].gpus[d%4],d/4,d%4,get,Q38_WORKER_BAR_MAP_BYTES);v.host=reinterpret_cast<ResidentDynamicControl*>(qmem[d].cpu);v.device=reinterpret_cast<ResidentDynamicControl*>(qmem[d].va);

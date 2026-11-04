@@ -50,7 +50,7 @@ $DAEMON status --control-socket "$CTRL" > "$RUN/daemon-status-before.json"
 SNAP=$(python3 - "$RUN/daemon-status-before.json" "$MANIFEST" "$SNAP" <<'PY'
 import json, sys, re, os
 s = json.load(open(sys.argv[1])); m = open(sys.argv[2]).read()
-assert s.get('status') == 'READY' and s.get('layers_ready') == 48 and s.get('worker_activity') == 'PARKED', s.get('status')
+assert s.get('status') == 'READY' and s.get('layers_ready') in (48, 49) and s.get('worker_activity') == 'PARKED', s.get('status')
 snap = s.get('multicast_snapshot_root') or ''
 assert os.path.dirname(snap) == sys.argv[3] and os.path.isdir(snap), (snap, sys.argv[3])
 rid = re.search(r'^run_id\tdaemon:(\d+)$', m, re.M); assert rid and int(rid.group(1)) == s['pid']
@@ -141,7 +141,7 @@ checks = {
  'acs_restored_all': len(re.findall(r'^ACS_RESTORE,.*,match,1$', wrap, re.M)) == n_acs,
  'dma_helper_unloaded': not pathlib.Path('/sys/module/rtx_mc_dma_map').exists(),
  'mc_registers_unchanged': mc_same,
- 'daemon_ready_parked_48': after.get('status') == 'READY' and after.get('worker_activity') == 'PARKED' and after.get('layers_ready') == 48,
+ 'daemon_ready_parked_48': after.get('status') == 'READY' and after.get('worker_activity') == 'PARKED' and after.get('layers_ready') in (48, 49),
  'worker_seq_aligned_after': seq_rc == 0,
 }
 # Observed leaf/route counts (reported, not judged: the adapter may open once per engine process).

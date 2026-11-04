@@ -284,6 +284,7 @@ def _q38_batch_timing(worker=None) -> dict:
         def run(path, npass):
             inner.moe_batch = path in ("batch", "pipe")
             inner.moe_batch_pipe = path == "pipe"
+            inner.moe_multirow = path == "multi"
             inner.moe_batch_min_rows = inner.moe_batch_pipe_min_rows = 1
             cs = _torch.empty((npass, 48, R), dtype=_torch.int64, device="cuda:0")
             for it in range(npass):
@@ -305,7 +306,7 @@ def _q38_batch_timing(worker=None) -> dict:
         return rep
 
     saved = (inner.moe_batch, inner.moe_batch_min_rows, getattr(inner, "moe_batch_pipe", False),
-             getattr(inner, "moe_batch_pipe_min_rows", 33))
+             getattr(inner, "moe_batch_pipe_min_rows", 33), getattr(inner, "moe_multirow", False))
     out = {"passes": passes, "rows": {}}
     try:
         for R in rows_list:
@@ -322,14 +323,17 @@ def _q38_batch_timing(worker=None) -> dict:
             routes = (wgt / wgt.sum(1, keepdim=True)).to("cuda:0")
             res, last = {"distinct_experts": int(_torch.unique(ids).numel())}, {}
             for path in paths:
+                if path == "multi" and not 2 <= R <= getattr(inner, "moe_multirow_max", 2):
+                    continue                      # the multi-row exchange takes 2..max rows
                 inner.moe_batch = path in ("batch", "pipe")
                 inner.moe_batch_pipe = path == "pipe"
+                inner.moe_multirow = path == "multi"
                 inner.moe_batch_min_rows = inner.moe_batch_pipe_min_rows = 1
                 times, recs, wrecs = [], [], []
-                # the stamped pass must fit the 512-record worker rings: exchanges per layer = ceil(R/64) batched,
-                # ceil(R/32) pipelined, R per row
-                per_layer = {"batch": -(-R // 64), "pipe": -(-R // 32)}.get(path, R)
-                ring_layers = max(1, min(48, 480 // per_layer))
+                # the stamped pass must fit the 256-record worker rings (512 before 2026-11-04): exchanges per layer =
+                # ceil(R/64) batched, ceil(R/32) pipelined, ceil(R/2) multi-row, R per row
+                per_layer = {"batch": -(-R // 64), "pipe": -(-R // 32), "multi": 1}.get(path, R)
+                ring_layers = max(1, min(48, 240 // per_layer))
                 for p in range(passes + 2):
                     ring = p == passes + 1
                     _torch.cuda.synchronize()
@@ -355,11 +359,13 @@ def _q38_batch_timing(worker=None) -> dict:
                 res[path] = {"ms_per_layer_call": round(st.median(times) * 1e3 / 48, 3),
                              "us_per_row_per_layer": round(st.median(times) * 1e6 / 48 / R, 1),
                              "rtx_us": rtx_phases(recs)}
-                res[path]["worker_us"] = worker_phases(wrecs, *{"batch": (3, 4), "pipe": (5, 6)}.get(path, (1, 2)))
+                res[path]["worker_us"] = worker_phases(wrecs, *{"batch": (3, 4), "pipe": (5, 6), "multi": (7, 8)}.get(path, (1, 2)))
                 res[path]["worker_stamped_layers"] = ring_layers
             ref = paths[0]
-            res["identical_to_" + ref] = {p: bool(_torch.equal(last[p], last[ref])) for p in paths[1:]}
-            res["max_abs_diff_to_" + ref] = {p: float((last[p] - last[ref]).abs().max()) for p in paths[1:]}
+            res["identical_to_" + ref] = {p: bool(_torch.equal(last[p], last[ref])) for p in paths[1:] if p in last}
+            res["max_abs_diff_to_" + ref] = {p: float((last[p] - last[ref]).abs().max()) for p in paths[1:] if p in last}
+            if "multi" in last and "per_row" in last:
+                res["speedup_multi_vs_per_row"] = round(res["per_row"]["ms_per_layer_call"] / res["multi"]["ms_per_layer_call"], 3)
             if "batch" in last and "per_row" in last:
                 res["bit_identical_last_layer"] = bool(_torch.equal(last["batch"], last["per_row"]))
                 res["speedup_batch_vs_per_row"] = round(res["per_row"]["ms_per_layer_call"] / res["batch"]["ms_per_layer_call"], 3)
@@ -369,14 +375,67 @@ def _q38_batch_timing(worker=None) -> dict:
             if stress:
                 res["stress"] = stress_check(R, h, ids, routes)
                 print(f"Q38_BATCH_STRESS,R,{R},{res['stress']}", flush=True)
-            print(f"Q38_BATCH_TIMING,R,{R}," + ",".join(f"{p}_ms,{res[p]['ms_per_layer_call']}" for p in paths)
+            print(f"Q38_BATCH_TIMING,R,{R}," + ",".join(f"{p}_ms,{res[p]['ms_per_layer_call']}" for p in paths if p in res)
                   + f",identical_to_{ref},{res['identical_to_' + ref]},speedup_batch_vs_per_row,{res.get('speedup_batch_vs_per_row')}"
                   + f",speedup_pipe_vs_batch,{res.get('speedup_pipe_vs_batch')}"
-                  + "".join(f",rtx_{p},{res[p]['rtx_us']},workers_{p},{res[p].get('worker_us')}" for p in paths), flush=True)
+                  + f",speedup_multi_vs_per_row,{res.get('speedup_multi_vs_per_row')}"
+                  + "".join(f",rtx_{p},{res[p]['rtx_us']},workers_{p},{res[p].get('worker_us')}" for p in paths if p in res), flush=True)
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        inner.moe_batch, inner.moe_batch_min_rows, inner.moe_batch_pipe, inner.moe_batch_pipe_min_rows = saved
+        inner.moe_batch, inner.moe_batch_min_rows, inner.moe_batch_pipe, inner.moe_batch_pipe_min_rows, inner.moe_multirow = saved
+    return out
+
+
+def _q38_lm2_check(worker=None) -> dict:
+    """Q38_LM2_CHECK=N (2026-11-04), inside the vLLM worker after the generations: N random BF16 row groups through the
+    M10 LM head as one multi-row exchange and as single-row exchanges, for each row count in Q38_LM2_CHECK_ROWS
+    (default "2"). Must hold: identical log-sum-exps (bits), and every logit the multi-row call returns (its K may be
+    smaller: (2560 - n) // n - 1) equals the single-row logit; candidates beyond the smaller K are -inf. "argmax_bad"
+    counts rows whose argmax differs. Times both forms (median, one sync per call)."""
+    import os as _os
+    import statistics as st
+    import sys as _s
+    import time as _t
+    import torch as _torch
+    inner = getattr(getattr(_s.modules.get("sitecustomize"), "_adapter", None), "_inner", None)
+    if inner is None or not getattr(inner, "lm_head_m10", False):
+        return {"error": "no RTX peer adapter with the M10 LM head"}
+    n = int(_os.environ.get("Q38_LM2_CHECK", "0"))
+    row_counts = [int(x) for x in _os.environ.get("Q38_LM2_CHECK_ROWS", "2").replace(",", " ").split()]
+    gen = _torch.Generator(device="cpu").manual_seed(4321)
+    saved = _os.environ.get("Q38_M10_LM_HEAD_ROWS2")
+    out = {"groups": n}
+    try:
+        for nr in row_counts:
+            res = {"bad_lse": 0, "bad_logits": 0, "argmax_bad": 0}
+            t1, t2 = [], []
+            for i in range(n):
+                x = (_torch.randn(nr, 2560, generator=gen) * 1.5).to(_torch.bfloat16).to("cuda:0")
+                _os.environ["Q38_M10_LM_HEAD_ROWS2"] = "0"
+                _torch.cuda.synchronize(); t0 = _t.perf_counter()
+                a = inner.lm_head_logits(x); la = inner.last_lm_lse.clone()
+                _torch.cuda.synchronize(); t1.append(_t.perf_counter() - t0)
+                _os.environ["Q38_M10_LM_HEAD_ROWS2"] = "1"
+                t0 = _t.perf_counter()
+                b = inner.lm_head_logits(x); lb = inner.last_lm_lse.clone()
+                _torch.cuda.synchronize(); t2.append(_t.perf_counter() - t0)
+                res["bad_lse"] += int((la.view(_torch.int32) != lb.view(_torch.int32)).sum())
+                fin = _torch.isfinite(b.float())
+                res["bad_logits"] += int(((a.view(_torch.int16) != b.view(_torch.int16)) & fin).any(dim=1).sum())
+                res["argmax_bad"] += int((a.float().argmax(1) != b.float().argmax(1)).sum())
+            res["ms_single_rows"] = round(st.median(t1) * 1e3, 3)
+            res["ms_one_multi"] = round(st.median(t2) * 1e3, 3)
+            out[f"rows{nr}"] = res
+        inner.check_error()
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if saved is None:
+            _os.environ.pop("Q38_M10_LM_HEAD_ROWS2", None)
+        else:
+            _os.environ["Q38_M10_LM_HEAD_ROWS2"] = saved
+    print("Q38_LM2_CHECK," + ",".join(f"{k},{v}" for k, v in out.items()), flush=True)
     return out
 
 
@@ -459,7 +518,7 @@ def main() -> int:
 
     try:
         manager_before = send_control(args.control_socket, "STATUS")
-        if manager_before.get("status") != "READY" or manager_before.get("layers_ready") != 48:
+        if manager_before.get("status") != "READY" or manager_before.get("layers_ready") not in (48, 49):   # 49 = with the MTP layer
             raise RuntimeError(f"M10 resident service is not fully ready: {manager_before}")
         client_model_hash = sha256_file(model / "model.safetensors.index.json")
         if manager_before.get("model_index_sha256") != client_model_hash:
@@ -660,6 +719,8 @@ def main() -> int:
         os.environ["Q38_M10_BOOTSTRAP_LOG"] = str(bootstrap_log)
 
         llm_started = time.monotonic()
+        mtp_tokens = int(os.environ.get("Q38_MTP_SPEC_TOKENS", "0") or 0)
+        result["mtp_spec_tokens"] = mtp_tokens
         llm = LLM(
             model=str(model), tokenizer=str(model), trust_remote_code=True,
             tensor_parallel_size=1, dtype="bfloat16", gpu_memory_utilization=args.gpu_memory_utilization,
@@ -683,8 +744,13 @@ def main() -> int:
             # PIECEWISE: vLLM's GDN/QSA cores are eager breaks. Q38_VLLM_CUDAGRAPH_FULL=1:
             # FULL_AND_PIECEWISE with a breakable FULL wrapper (q38_cudagraph_breaks.
             # install_full_breakable) captures those cores; only our host breaks stay eager.
-            **({"compilation_config": {"cudagraph_mode": cudagraph_mode, "cudagraph_capture_sizes": [1]}}
+            **({"compilation_config": {"cudagraph_mode": cudagraph_mode,
+                                       "cudagraph_capture_sizes": sorted({1, 1 + mtp_tokens})}}
                if cuda_graphs else {}),
+            # Q38_MTP_SPEC_TOKENS=N (2026-11-04): MTP speculative decoding with the checkpoint's MTP layer, N draft
+            # tokens per step (its experts are resident layer 48 on the M10s: daemon Q38_DAEMON_LAYERS=49).
+            **({"speculative_config": {"method": "mtp", "num_speculative_tokens": mtp_tokens},
+                "disable_log_stats": False} if mtp_tokens > 0 else {}),
         )
         result["cuda_graphs"] = cuda_graphs
         try:
@@ -711,9 +777,24 @@ def main() -> int:
         # With the M10 LM head the logits are the 24 x K candidates (BF16, -inf elsewhere): the logprobs are normalized
         # over the candidates, differences between them are the exact logit differences.
         q38_logprobs = int(os.environ.get("Q38_VLLM_LOGPROBS", "0") or 0)
+        # Q38_VLLM_IGNORE_EOS=1 (2026-11-04): always generate max_new_tokens (equal-length speed comparisons)
         sampling = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens, seed=0,
+                                  ignore_eos=os.environ.get("Q38_VLLM_IGNORE_EOS") == "1",
                                   **({"logprobs": q38_logprobs} if q38_logprobs > 0 else {}))
         generations = []
+
+        def spec_metrics() -> dict:
+            out_m = {}
+            try:
+                for m in llm.get_metrics():
+                    if "spec_decode" in m.name:
+                        v = getattr(m, "value", None)
+                        if v is None and hasattr(m, "values"):
+                            v = list(m.values)
+                        out_m[m.name] = v
+            except Exception as exc:          # metrics need disable_log_stats=False (set with Q38_MTP_SPEC_TOKENS)
+                out_m["error"] = f"{type(exc).__name__}: {exc}"
+            return out_m
         for repeat in range(args.repeats):
             started_unix = time.time()
             started = time.monotonic()
@@ -731,6 +812,9 @@ def main() -> int:
                 "elapsed_seconds": elapsed,
                 "started_unix": started_unix, "ended_unix": started_unix + elapsed,
             })
+            if mtp_tokens > 0:              # cumulative vLLM counters (drafts, draft tokens, accepted tokens)
+                generations[-1]["spec_decode_metrics"] = spec_metrics()
+                print("Q38_SPEC_DECODE," + json.dumps(generations[-1]["spec_decode_metrics"]), flush=True)
             if q38_logprobs > 0:
                 # per generated token: [[token_id, logprob], ...] best first (top-N plus the chosen token)
                 generations[-1]["top_logprobs"] = [
@@ -922,6 +1006,11 @@ def main() -> int:
                 result["graph_ceiling"] = llm.collective_rpc(_q38_graph_ceiling, timeout=600, args=(ceiling_iters,))
             except BaseException as exc:
                 result["graph_ceiling"] = {"error": f"{type(exc).__name__}: {exc}"}
+        if llm is not None and int(os.environ.get("Q38_LM2_CHECK", "0") or 0) > 0 and "error" not in result:
+            try:   # after every generation, while the peer path is still open
+                result["lm2_check"] = llm.collective_rpc(_q38_lm2_check, timeout=600)
+            except BaseException as exc:
+                result["lm2_check"] = {"error": f"{type(exc).__name__}: {exc}"}
         if llm is not None and os.environ.get("Q38_BATCH_TIMING") == "1" and "error" not in result:
             try:   # after every generation, while the peer path is still open
                 result["batch_timing"] = llm.collective_rpc(_q38_batch_timing, timeout=900)

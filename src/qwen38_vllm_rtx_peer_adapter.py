@@ -46,6 +46,27 @@ def _progress_loop(period: float) -> None:
         last_tokens, last_t = tok, now
 
 
+# Optional CUDA profiler range for nsys --capture-range=cudaProfilerApi (2026-11-04): cudaProfilerStart at
+# decode token Q38_CUDA_PROFILER_START_TOKENS (0 = off), cudaProfilerStop Q38_CUDA_PROFILER_TOKENS (default
+# 200) tokens later. Called from _progress_note, i.e. on the engine thread, where the RTX is CUDA device 0.
+_cuprof = {"state": 0}
+
+
+def _cuda_profiler_note(tok: int) -> None:
+    start = int(os.environ.get("Q38_CUDA_PROFILER_START_TOKENS", "0") or 0)
+    if start <= 0 or _cuprof["state"] == 2:
+        return
+    count = int(os.environ.get("Q38_CUDA_PROFILER_TOKENS", "200") or 200)
+    if _cuprof["state"] == 0 and tok >= start:
+        torch.cuda.cudart().cudaProfilerStart()
+        _cuprof["state"] = 1
+        print(f"Q38_CUDA_PROFILER,start,decode_tokens,{tok}", file=_sys.stderr, flush=True)
+    elif _cuprof["state"] == 1 and tok >= start + count:
+        torch.cuda.cudart().cudaProfilerStop()
+        _cuprof["state"] = 2
+        print(f"Q38_CUDA_PROFILER,stop,decode_tokens,{tok}", file=_sys.stderr, flush=True)
+
+
 def _progress_note(rows: int) -> None:
     period = float(os.environ.get("Q38_PROGRESS_SECONDS", "10"))
     if period <= 0:
@@ -61,6 +82,9 @@ def _progress_note(rows: int) -> None:
         if _progress["thread"] is None:
             _progress["thread"] = _threading.Thread(target=_progress_loop, args=(period,), daemon=True)
             _progress["thread"].start()
+        tok = _progress["decode_tokens"]
+    if rows == 1:
+        _cuda_profiler_note(tok)
 
 
 class PeerOpenError(RuntimeError):
@@ -215,6 +239,17 @@ class RtxPeerResidentM10MoEAdapter:
         self.moe_batch_pipe_calls = 0
         self.lib.q38_rtx_peer_moe_batch_pipe_gpu.argtypes = list(self.lib.q38_rtx_peer_moe_batch_gpu.argtypes)
         self.lib.q38_rtx_peer_moe_batch_pipe_gpu.restype = ctypes.c_int
+        # Multi-row decode MoE (Q38_RTX_PEER_MOE_MULTIROW=1, 2026-11-04; worker mode 10, resident_multirow_abi.cuh):
+        # calls of exactly 2 BF16 rows (MTP verify, batch decode) go as ONE exchange through the PEX multicast
+        # request and remapped return pages, instead of 2 mode-1 exchanges or one host-staged mode-8 exchange.
+        # The library reads the same variable at open (extra return / card-sum routes).
+        self.moe_multirow = self.gpu_driven and os.environ.get("Q38_RTX_PEER_MOE_MULTIROW") == "1"
+        # Q38_RTX_PEER_MOE_MULTIROW_MAX (2..4, default 2): the most rows one exchange takes (the library sizes its
+        # return / card-sum routes for it at open); calls of 2..max rows go as one mode-10 exchange.
+        self.moe_multirow_max = int(os.environ.get("Q38_RTX_PEER_MOE_MULTIROW_MAX", "2") or 2) if self.moe_multirow else 0
+        self.moe_multirow_calls = 0
+        self.lib.q38_rtx_peer_moe2_gpu.argtypes = list(self.lib.q38_rtx_peer_moe_batch_gpu.argtypes)
+        self.lib.q38_rtx_peer_moe2_gpu.restype = ctypes.c_int
         # LM head on the M10s (Q38_M10_LM_HEAD=1, needs the GPU-driven path and LMHEAD manifest rows): one
         # broadcast exchange per row returns every worker's exact top-K + log-sum-exp (worker mode 7).
         self.lm_head_m10 = self.gpu_driven and os.environ.get("Q38_M10_LM_HEAD") == "1"
@@ -227,6 +262,10 @@ class RtxPeerResidentM10MoEAdapter:
                                                        ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
                                                        ctypes.c_char_p, ctypes.c_size_t]
         self.lib.q38_rtx_peer_lm_head_topk.restype = ctypes.c_int
+        self.lib.q38_rtx_peer_lm_head_topk_rows.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                                            ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                                            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        self.lib.q38_rtx_peer_lm_head_topk_rows.restype = ctypes.c_int
         self.lib.q38_rtx_peer_timing_enable.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t]
         self.lib.q38_rtx_peer_timing_enable.restype = ctypes.c_int
         self.lib.q38_rtx_peer_timing_read.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
@@ -451,6 +490,7 @@ class RtxPeerResidentM10MoEAdapter:
                 "calls": self.calls, "rows": self.rows, "host_payload_relay_bytes": 0,
                 "gpu_driven": self.gpu_driven, "gpu_counters": getattr(self, "_gpu_counters_at_close", {}),
                 "moe_batch": self.moe_batch, "moe_batch_reuse_files": self.reuse_files, "moe_batch_eager_calls": self.moe_batch_calls, "moe_batch_eager_rows": self.moe_batch_rows, "moe_batch_pipe": self.moe_batch_pipe, "moe_batch_pipe_eager_calls": self.moe_batch_pipe_calls,
+                "moe_multirow": self.moe_multirow, "moe_multirow_eager_calls": self.moe_multirow_calls,
                 "ple_gpu": self.ple_gpu, "ple_gpu_eager_calls": self.ple_gpu_calls, "ple_gpu_eager_rows": self.ple_gpu_rows,
                 "lm_head_m10": self.lm_head_m10, "lm_topk": self.lm_topk, "lm_vocab": self.lm_vocab, "lm_calls": self.lm_calls,
                 "async_window": self.async_window,
@@ -504,10 +544,21 @@ class RtxPeerResidentM10MoEAdapter:
                 tensor.record_stream(stream_obj)
         h_type = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[hidden.dtype]
         error = ctypes.create_string_buffer(1024)
-        batch = self.moe_batch and rows >= self.moe_batch_min_rows
+        multi = self.moe_multirow and 2 <= rows <= self.moe_multirow_max and h_type == 2
+        batch = not multi and self.moe_batch and rows >= self.moe_batch_min_rows
+        if multi:
+            rc = self.lib.q38_rtx_peer_moe2_gpu(
+                int(layer_id), ctypes.c_void_p(h.data_ptr()), h_type, ctypes.c_void_p(ids.data_ptr()),
+                ctypes.c_void_p(routes.data_ptr()), rows, ctypes.c_void_p(joined.data_ptr()),
+                ctypes.c_void_p(stream_obj.cuda_stream), error, len(error))
+            if rc:
+                raise RuntimeError(f"multi-row MoE enqueue layer {layer_id} rows {rows}: "
+                                   f"{error.value.decode(errors='replace')}")
+            if not capturing:
+                self.moe_multirow_calls += 1
         if batch:
             self._forward_gpu_batch(layer_id, h, h_type, ids, routes, joined, rows, stream_obj.cuda_stream)
-        for row in range(0 if batch else rows):
+        for row in range(0 if (batch or multi) else rows):
             rc = self.lib.q38_rtx_peer_forward_gpu(
                 int(layer_id), ctypes.c_void_p(h.data_ptr() + row * 2560 * h.element_size()), h_type,
                 ctypes.c_void_p(ids.data_ptr() + row * 10 * ids.element_size()),
@@ -628,6 +679,19 @@ class RtxPeerResidentM10MoEAdapter:
                 tensor.record_stream(stream_obj)
         h_type = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[h.dtype]
         error = ctypes.create_string_buffer(1024)
+        # Q38_M10_LM_HEAD_ROWS2=1 (2026-11-04): 2..4 BF16 rows (MTP verify) in ONE LM-head exchange (worker mode 7 with
+        # N rows: one slice read, per row the same top-K and log-sum-exp). The record holds N(K+1) <= 2560 - N words,
+        # so K is capped at (2560 - N) // N - 1 for N rows (638 for 4; still far above any sampling top-k).
+        if (2 <= n <= 4 and h_type == 2 and os.environ.get("Q38_M10_LM_HEAD_ROWS2") == "1"):
+            k_rows = min(self.lm_topk, (2560 - n) // n - 1)
+            rc = self.lib.q38_rtx_peer_lm_head_topk_rows(
+                ctypes.c_void_p(h.data_ptr()), h_type, ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(lse.data_ptr()),
+                k_rows, n, None, ctypes.c_void_p(stream_obj.cuda_stream), error, len(error))
+            if rc:
+                raise RuntimeError(f"M10 LM-head {n}-row enqueue: {error.value.decode(errors='replace')}")
+            self.lm_calls += 1
+            self.last_lm_lse = lse
+            return out
         for row in range(n):
             rc = self.lib.q38_rtx_peer_lm_head_topk(
                 ctypes.c_void_p(h.data_ptr() + row * h.shape[1] * h.element_size()), h_type,

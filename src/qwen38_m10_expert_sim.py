@@ -40,6 +40,11 @@ SLICE = INTERMEDIATE // WORKERS
 SHARED_WORKERS = 4
 SHARED_SLICE = INTERMEDIATE // SHARED_WORKERS
 PREFIX = "model.language_model.layers.{layer}.mlp."
+MTP_LAYER = 48          # the MTP layer's experts / shared expert, resident as layer 48 (2026-11-04)
+
+
+def layer_prefix(layer: int) -> str:
+    return "mtp.layers.0.mlp." if layer == MTP_LAYER else PREFIX.format(layer=layer)
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
@@ -106,7 +111,7 @@ def fp8_lut() -> np.ndarray:
 
 def selected_routes(layer: int, x: np.ndarray, weight_map: dict[str, str],
                     readers: dict[str, TensorReader], route_override: dict | None = None):
-    gate = load_tensor(PREFIX.format(layer=layer) + "gate.weight", weight_map, readers)
+    gate = load_tensor(layer_prefix(layer) + "gate.weight", weight_map, readers)
     if gate.shape != (512, HIDDEN):
         raise ValueError(f"layer {layer} router shape {gate.shape}, expected (512,2560)")
     logits = gate @ x
@@ -131,7 +136,7 @@ def selected_routes(layer: int, x: np.ndarray, weight_map: dict[str, str],
 def prepare_shared(layer: int, x: np.ndarray, weight_map: dict[str, str],
                    readers: dict[str, TensorReader], work: Path) -> tuple[np.ndarray, float, dict]:
     """Prepare checkpoint BF16 shared-expert weights for four GM107 slices."""
-    prefix = PREFIX.format(layer=layer)
+    prefix = layer_prefix(layer)
     g = load_tensor(prefix + "shared_expert.gate_proj.weight", weight_map, readers)
     u = load_tensor(prefix + "shared_expert.up_proj.weight", weight_map, readers)
     d = load_tensor(prefix + "shared_expert.down_proj.weight", weight_map, readers)
@@ -194,7 +199,7 @@ def expand_scale(s: np.ndarray, rows: int, cols: int) -> np.ndarray:
 def prepare_layer(layer: int, x: np.ndarray, ids: np.ndarray, probs: np.ndarray,
                   weight_map: dict[str, str], readers: dict[str, TensorReader], work: Path,
                   lut: np.ndarray) -> tuple[np.ndarray, dict]:
-    prefix = PREFIX.format(layer=layer)
+    prefix = layer_prefix(layer)
     qg, qu, qd, sg, su, sd = [], [], [], [], [], []
     for expert in ids.tolist():
         vals = {}

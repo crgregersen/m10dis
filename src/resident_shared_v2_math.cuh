@@ -144,3 +144,20 @@ __device__ __forceinline__ float q38_shared_v2_down_chunk(const uint16_t *d, con
     }
     return mine;
 }
+// Mode 10 (multi-row decode, 2026-11-04): q38_shared_v2_down_chunk for two hs rows, each d vector loaded once;
+// per row the same dot8, warp sum and broadcast, so m0 / m1 are bit-identical to two down_chunk calls.
+__device__ __forceinline__ void q38_shared_v2_down_chunk2(const uint16_t *d, const float *hs0, const float *hs1,
+                                                          int base, int lane, int S, float &m0, float &m1) {
+    m0 = 0.0f; m1 = 0.0f;
+    for (int r = 0; r < 32; ++r) {
+        float s0 = 0.0f, s1 = 0.0f;
+        if (lane < S / 8) {
+            const uint4 dv = __ldg(reinterpret_cast<const uint4 *>(d + size_t(base + r) * S) + lane);
+            s0 = q38_dot8(dv, hs0 + lane * 8, 0.0f);
+            s1 = q38_dot8(dv, hs1 + lane * 8, 0.0f);
+        }
+        s0 = q38_warp_sum(s0); s1 = q38_warp_sum(s1);
+        s0 = __shfl_sync(0xffffffffu, s0, 0); s1 = __shfl_sync(0xffffffffu, s1, 0);
+        if (lane == r) { m0 = s0; m1 = s1; }
+    }
+}

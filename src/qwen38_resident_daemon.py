@@ -688,7 +688,7 @@ def serve(args: argparse.Namespace) -> int:
         "loaded_layer_ids": [],
         "layer_start": args.layer_start,
         "layer_count": args.layer_count,
-        "sandbox_mode": args.layer_start != 0 or args.layer_count != 48,
+        "sandbox_mode": args.layer_start != 0 or args.layer_count not in (48, 49),
     }
     atomic_json(state_path, state)
     manager = None
@@ -764,6 +764,7 @@ def serve(args: argparse.Namespace) -> int:
 
         manager = ResidentServiceManager(
             args.routed_service.resolve(), args.shared_service.resolve(), out / "resident_expert_logs",
+            num_layers=49,   # 48 model layers + the MTP layer (layer 48); unloaded layers stay NOT_LOADED
         )
         control.manager = manager
         stream_pack_state: list[dict[str, Any]] = []
@@ -1085,12 +1086,13 @@ def main() -> int:
                                   help="assert that no external direct-PEX request is in flight")
     args = parser.parse_args()
     if args.mode == "serve":
-        if args.layer_start < 0 or args.layer_start >= 48:
-            parser.error("--layer-start must be in 0..47")
-        if args.layer_count < 1 or args.layer_count > 48:
-            parser.error("--layer-count must be in 1..48")
-        if args.layer_start + args.layer_count > 48:
-            parser.error("--layer-start + --layer-count must not exceed 48")
+        # 48 model layers + the MTP layer as layer 48 (2026-11-04: --layer-count 49 loads it too)
+        if args.layer_start < 0 or args.layer_start >= 49:
+            parser.error("--layer-start must be in 0..48")
+        if args.layer_count < 1 or args.layer_count > 49:
+            parser.error("--layer-count must be in 1..49")
+        if args.layer_start + args.layer_count > 49:
+            parser.error("--layer-start + --layer-count must not exceed 49 (48 layers + MTP)")
         if bool(args.direct_library) != bool(args.direct_groups):
             parser.error("--direct-library and --direct-groups must be supplied together")
         if not args.skip_ple:

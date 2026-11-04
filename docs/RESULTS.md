@@ -28,6 +28,21 @@ All numbers come from runs on the test machine (2026-11-02 to 2026-11-04). Every
 | `d4b` | 50.9–51.0 tok/s | FP8 hyper-connection matrices with tuned M = 1 GEMV (down 19.0 → 10.9 µs, up 14.6 → 6.4 µs per call) |
 | benchmark night | 52.4–52.8 tok/s | same configuration, longer runs |
 
+## MTP speculative decoding
+
+2026-11-04, the frozen serving configuration with `max_model_len` 32,768, 1000 generated tokens per run, MTP layer resident as layer 48, multi-row exchange up to 4 rows (`Q38_RTX_PEER_MOE_MULTIROW_MAX=4`) and the N-row LM head. Rates include the short prefill.
+
+| Draft tokens | Natural long-form prompt (`prompts/mtp_eval_prompt.txt`) | Humaneval prompt, `ignore_eos` |
+|---|---|---|
+| 0 | 53.4 tok/s | 51.8 tok/s |
+| 1 | **65.6** (70 % accepted, 1.70 tokens per step) | 69.4 (89 %) |
+| 2 | 65.4 (70 / 66 % per position) | 82.6 (97 / 97 %) |
+| 3 | 60.1 (67 / 67 / 56 %) | **89.6** (97 / 99 / 96 %) |
+
+The humaneval column overstates acceptance: with `ignore_eos` the model keeps going after its answer, and that continuation repeats. The best draft length is lower than on a single GPU, because every verify row costs M10 time: one multi-row exchange takes 150 / 239 / 337 / 432 µs per layer for 1 / 2 / 3 / 4 rows (bandwidth-bound: each row reads its own experts). Suggested: 2 draft tokens by default, 3 for code-heavy work. The MTP layer's attention KV costs about 21 % of the KV pool (66,628 instead of 84,440 tokens at 2.5 GiB).
+
+What did not help: unrolling the gate/up lane loop (gate/up 62 → 81 µs for 2 rows) and reading experts shared by consecutive tokens once (3.7 of 10 are shared on average; less load overlap made it slower). Both reverted. Records `mtp_*`, `mr_*`, `lm2_*`, `nrow_*`, `fastdown_*`, `final_*` in the run log.
+
 ## Where the time goes in one MoE layer
 
 ### Decode (1 token, mode 1)

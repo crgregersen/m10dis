@@ -30,15 +30,15 @@ def main() -> int:
     ap.add_argument("--layer", type=int, required=True)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
-    if not 0 <= args.layer < 48:
-        raise ValueError("layer must be in 0..47")
+    if not 0 <= args.layer <= qwen.MTP_LAYER:
+        raise ValueError("layer must be in 0..48 (48 = the MTP layer)")
     model = args.model.resolve()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     qwen.MODEL = model
     index_path = model / "model.safetensors.index.json"
     weight_map = json.loads(index_path.read_text())["weight_map"]
-    prefix = qwen.PREFIX.format(layer=args.layer)
+    prefix = qwen.layer_prefix(args.layer)
     workers = qwen.WORKERS
     width = qwen.SLICE
     hidden = qwen.HIDDEN

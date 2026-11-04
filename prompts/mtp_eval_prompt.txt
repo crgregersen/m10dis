@@ -1,0 +1,7 @@
+The following is a detailed technical article for experienced engineers.
+
+# How TCP Congestion Control Works
+
+TCP congestion control is the set of algorithms a sender uses to decide how much unacknowledged data it may have in flight. This article explains the problem it solves, then walks through slow start, congestion avoidance, fast retransmit and fast recovery, the move from loss-based to delay- and model-based algorithms such as CUBIC and BBR, and the practical consequences for people who operate networks and write networked software.
+
+## 1. The problem

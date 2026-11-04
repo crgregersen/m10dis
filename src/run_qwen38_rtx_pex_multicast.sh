@@ -62,7 +62,7 @@ for r in records:
     assert int(r[6], 0) % 65536 == 0
 status = json.loads(subprocess.check_output([sys.executable, str(root / 'src/qwen38_resident_daemon.py'),
                                              'status', '--control-socket', str(sock)], text=True))
-assert status['status'] == 'READY' and status['layers_ready'] == 48 and status['worker_activity'] == 'PARKED', status
+assert status['status'] == 'READY' and status['layers_ready'] in (48, 49) and status['worker_activity'] == 'PARKED', status
 assert status['multicast_snapshot_root'] == str(snapshots)
 print(f"ACTIVE_DAEMON_CHECK,PASS,pid,{status['pid']},layers,{status['layers_ready']},workers,{status['worker_activity']}")
 PY
@@ -148,7 +148,7 @@ root, sock, out = map(pathlib.Path, sys.argv[1:])
 s=json.loads(subprocess.check_output([sys.executable, str(root/'src/qwen38_resident_daemon.py'),
     'status','--control-socket',str(sock)],text=True))
 out.write_text(json.dumps(s,indent=2)+'\n')
-assert s['status']=='READY' and s['layers_ready']==48 and s['worker_activity']=='PARKED',s
+assert s['status']=='READY' and s['layers_ready'] in (48, 49) and s['worker_activity']=='PARKED',s
 print(f"ACTIVE_DAEMON_AFTER,PASS,pid,{s['pid']},layers,{s['layers_ready']},workers,{s['worker_activity']}")
 PY
 

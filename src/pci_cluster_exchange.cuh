@@ -156,6 +156,19 @@ __device__ unsigned pci_cluster_row_gather(const Control *c, ResidentDirectResul
 #define PCI_CLUSTER_LM_MAX_K 2559u
 #define PCI_CLUSTER_REASON_LM_CONFIG 2048u   // no table / size / return flag / bad K / bad worker index
 #define PCI_CLUSTER_REASON_LM_SLICE 4096u    // slice misaligned, bad row count, or not ending at the table end
+// Two rows per request (2026-11-04, MTP verify): control->reserved == PCI_CLUSTER_LM_FMT_BF16X2 means x holds
+// two BF16 rows (row 0 at x, row 1 at PCI_CLUSTER_LM_X1_OFF, as the multi-row MoE mode 10). The slice is read
+// once for both; row 1's logits go to the worker's batch scratch; row r's result starts at word r*(K+1)
+// (count, then the candidates); row 1's log-sum-exp is the float in result word PCI_CLUSTER_LM_LSE1_WORD.
+// reserved == 0: one FP32 row (the original layout).
+#define PCI_CLUSTER_LM_FMT_BF16X2 2u
+#define PCI_CLUSTER_LM_X1_OFF 0x9470u
+#define PCI_CLUSTER_LM_LSE1_WORD 2559u
+// N rows (2026-11-04 evening): reserved = N in 2..4; row r's x at the multi-row MoE offsets (0x8070, 0x9470, 0xC000,
+// 0xD400), logits of row r >= 1 in the batch scratch at (r-1) * rows * 4, result of row r at word r*(K+1), LSE of
+// row r >= 1 in word PCI_CLUSTER_LM_LSE1_WORD - (r-1). Needs N*(K+1) <= 2560 - N.
+#define PCI_CLUSTER_LM_MAX_NROWS 4u
+__host__ __device__ constexpr unsigned pci_cluster_lm_x_off(unsigned r) { return r == 0 ? 0x8070u : r == 1 ? 0x9470u : r == 2 ? 0xC000u : 0xD400u; }
 
 __device__ __forceinline__ unsigned pci_cluster_bf16_bits(float v) {        // round to nearest even
     unsigned u = __float_as_uint(v);
@@ -176,6 +189,10 @@ __device__ unsigned pci_cluster_lm_validate(const Control *c, const uint8_t *tab
         !(v->cpu_mailbox_reserved & Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN))
         return PCI_CLUSTER_REASON_LM_CONFIG;
     const unsigned long long off = v->ple_offsets[2 * me], rows = v->ple_offsets[2 * me + 1];
+    const unsigned n = v->reserved;
+    if (n == 1 || n > PCI_CLUSTER_LM_MAX_NROWS) return PCI_CLUSTER_REASON_LM_CONFIG;
+    if (n >= 2 && (n * (k + 1u) > 2560u - n || !v->batch_scratch || v->batch_scratch_bytes < (n - 1ull) * rows * 4ull))
+        return PCI_CLUSTER_REASON_LM_CONFIG;
     if ((off & 15ull) || rows < 1 || rows > PCI_CLUSTER_LM_MAX_ROWS || off > bytes ||
         bytes - off != rows * (PCI_CLUSTER_LM_ROW_BYTES + 4ull))
         return PCI_CLUSTER_REASON_LM_SLICE;
@@ -226,8 +243,99 @@ __device__ void pci_cluster_lm_matvec(const Control *c, const uint8_t *table, fl
 
 // Block 0 only, after a grid barrier: exact top-K + log-sum-exp; writes the result to the RTX slot and
 // direct; returns the log-sum-exp (valid in thread 0).
+// Two-row matvec (all threads of the grid): BF16 x rows into xs0 / xs1 (exact widening), one weight read
+// per table row for both; per row the same fmaf order as pci_cluster_lm_matvec.
 template <class Control>
-__device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, ResidentDirectResult *direct) {
+__device__ void pci_cluster_lm_matvec2(const Control *c, const uint8_t *table, float *xs0, float *xs1) {
+    const volatile Control *v = c;
+    const unsigned me = v->cpu_mailbox_worker;
+    const unsigned long long off = v->ple_offsets[2 * me];
+    const unsigned rows = static_cast<unsigned>(v->ple_offsets[2 * me + 1]);
+    const volatile uint32_t *x0 = reinterpret_cast<const volatile uint32_t *>(v->x);
+    const volatile uint32_t *x1 = reinterpret_cast<const volatile uint32_t *>(reinterpret_cast<const volatile char *>(c) + PCI_CLUSTER_LM_X1_OFF);
+    for (unsigned i = threadIdx.x; i < PCI_CLUSTER_LM_HIDDEN / 2; i += blockDim.x) {
+        const uint32_t a = x0[i], b = x1[i];
+        xs0[2 * i] = __uint_as_float(a << 16); xs0[2 * i + 1] = __uint_as_float(a & 0xffff0000u);
+        xs1[2 * i] = __uint_as_float(b << 16); xs1[2 * i + 1] = __uint_as_float(b & 0xffff0000u);
+    }
+    __syncthreads();
+    const uint4 *w = reinterpret_cast<const uint4 *>(table + off);
+    unsigned *scratch0 = reinterpret_cast<unsigned *>(const_cast<uint8_t *>(table) + off + size_t(rows) * PCI_CLUSTER_LM_ROW_BYTES);
+    unsigned *scratch1 = reinterpret_cast<unsigned *>(v->batch_scratch);
+    const unsigned lane = threadIdx.x & 31u, warps_per_block = blockDim.x >> 5;
+    const unsigned nwarps = gridDim.x * warps_per_block;
+    for (unsigned r = blockIdx.x * warps_per_block + (threadIdx.x >> 5); r < rows; r += nwarps) {
+        const uint4 *row = w + size_t(r) * PCI_CLUSTER_LM_ROW_VEC;
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (unsigned j = lane; j < PCI_CLUSTER_LM_ROW_VEC; j += 32u) {
+            const uint4 q = row[j];
+            const float *xa = xs0 + j * 8u, *xb = xs1 + j * 8u;
+            const unsigned words[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int t = 0; t < 4; t++) {
+                const float wl = __uint_as_float(words[t] << 16), wh = __uint_as_float(words[t] & 0xffff0000u);
+                acc0 = fmaf(wl, xa[2 * t], acc0); acc0 = fmaf(wh, xa[2 * t + 1], acc0);
+                acc1 = fmaf(wl, xb[2 * t], acc1); acc1 = fmaf(wh, xb[2 * t + 1], acc1);
+            }
+        }
+#pragma unroll
+        for (int s = 16; s > 0; s >>= 1) { acc0 += __shfl_down_sync(0xffffffffu, acc0, s); acc1 += __shfl_down_sync(0xffffffffu, acc1, s); }
+        if (!lane) { scratch0[r] = pci_cluster_bf16_bits(acc0); scratch1[r] = pci_cluster_bf16_bits(acc1); }
+    }
+    __threadfence();
+}
+
+// 3-4 rows: x rows as BF16 words, rows 0-1 in xsA (2 x H/2 words), rows 2-3 in xsB; exact widening in the
+// inner loop, the same fmaf order per row as pci_cluster_lm_matvec.
+template <int N, class Control>
+__device__ void pci_cluster_lm_matvecN(const Control *c, const uint8_t *table, uint32_t *xsA, uint32_t *xsB) {
+    const volatile Control *v = c;
+    const unsigned me = v->cpu_mailbox_worker;
+    const unsigned long long off = v->ple_offsets[2 * me];
+    const unsigned rows = static_cast<unsigned>(v->ple_offsets[2 * me + 1]);
+    for (int r = 0; r < N; r++) {
+        const volatile uint32_t *src = reinterpret_cast<const volatile uint32_t *>(reinterpret_cast<const volatile char *>(c) + pci_cluster_lm_x_off(r));
+        uint32_t *dst = (r < 2 ? xsA : xsB) + (r & 1) * (PCI_CLUSTER_LM_HIDDEN / 2);
+        for (unsigned i = threadIdx.x; i < PCI_CLUSTER_LM_HIDDEN / 2; i += blockDim.x) dst[i] = src[i];
+    }
+    __syncthreads();
+    const uint4 *w = reinterpret_cast<const uint4 *>(table + off);
+    unsigned *scratch0 = reinterpret_cast<unsigned *>(const_cast<uint8_t *>(table) + off + size_t(rows) * PCI_CLUSTER_LM_ROW_BYTES);
+    unsigned *scratchb = reinterpret_cast<unsigned *>(v->batch_scratch);
+    const unsigned lane = threadIdx.x & 31u, warps_per_block = blockDim.x >> 5;
+    const unsigned nwarps = gridDim.x * warps_per_block;
+    for (unsigned r = blockIdx.x * warps_per_block + (threadIdx.x >> 5); r < rows; r += nwarps) {
+        const uint4 *row = w + size_t(r) * PCI_CLUSTER_LM_ROW_VEC;
+        float acc[N];
+#pragma unroll
+        for (int i = 0; i < N; i++) acc[i] = 0.0f;
+        for (unsigned j = lane; j < PCI_CLUSTER_LM_ROW_VEC; j += 32u) {
+            const uint4 q = row[j];
+            const unsigned words[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+            for (int i = 0; i < N; i++) {
+                const uint32_t *xw = (i < 2 ? xsA : xsB) + (i & 1) * (PCI_CLUSTER_LM_HIDDEN / 2) + j * 4u;
+#pragma unroll
+                for (int t = 0; t < 4; t++) {
+                    const uint32_t xv = xw[t];
+                    acc[i] = fmaf(__uint_as_float(words[t] << 16), __uint_as_float(xv << 16), acc[i]);
+                    acc[i] = fmaf(__uint_as_float(words[t] & 0xffff0000u), __uint_as_float(xv & 0xffff0000u), acc[i]);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < N; i++) {
+            for (int s2 = 16; s2 > 0; s2 >>= 1) acc[i] += __shfl_down_sync(0xffffffffu, acc[i], s2);
+            if (!lane) (i ? scratchb + size_t(i - 1) * rows : scratch0)[r] = pci_cluster_bf16_bits(acc[i]);
+        }
+    }
+    __threadfence();
+}
+
+// scratch_override / base (2-row requests): select from that logits scratch and write the result at word base.
+template <class Control>
+__device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, ResidentDirectResult *direct,
+                                       const unsigned *scratch_override = nullptr, unsigned base = 0) {
     __shared__ unsigned hist[256];
     __shared__ unsigned s_thr, s_take_eq, s_cnt, s_eq;
     __shared__ float s_red[32];
@@ -236,7 +344,8 @@ __device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, R
     const unsigned long long off = v->ple_offsets[2 * me];
     const unsigned rows = static_cast<unsigned>(v->ple_offsets[2 * me + 1]);
     const unsigned k = min(v->ple_count, rows);
-    const volatile unsigned *scratch = reinterpret_cast<const volatile unsigned *>(table + off + size_t(rows) * PCI_CLUSTER_LM_ROW_BYTES);
+    const volatile unsigned *scratch = scratch_override ? scratch_override :
+        reinterpret_cast<const volatile unsigned *>(table + off + size_t(rows) * PCI_CLUSTER_LM_ROW_BYTES);
     const unsigned tid = threadIdx.x, nt = blockDim.x;
     // pass 1: high byte of the order key
     for (unsigned i = tid; i < 256; i += nt) hist[i] = 0;
@@ -275,8 +384,8 @@ __device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, R
         if (take) {
             const unsigned slot_i = 1u + atomicAdd(&s_cnt, 1u);
             const unsigned e = (b << 16) | r;
-            out_dir[slot_i] = e;
-            if (out_slot) out_slot[slot_i] = e;
+            out_dir[base + slot_i] = e;
+            if (out_slot) out_slot[base + slot_i] = e;
         }
     }
     // log-sum-exp (FP32) over the BF16-rounded logits
@@ -298,8 +407,8 @@ __device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, R
     if (!tid) {
         float t = 0.0f; for (unsigned w = 0; w < (nt >> 5); w++) t += s_red[w];
         lse = gmax + __logf(t);
-        out_dir[0] = s_cnt;
-        if (out_slot) out_slot[0] = s_cnt;
+        out_dir[base] = s_cnt;
+        if (out_slot) out_slot[base] = s_cnt;
     }
     __threadfence_system();
     return lse;
@@ -309,11 +418,13 @@ __device__ float pci_cluster_lm_select(const Control *c, const uint8_t *table, R
 // Worker-side MoE timing (2026-11-03, batched-MoE research). When ple_reserved[0] bit 0 is set (per
 // worker, by q38_rtx_peer_worker_timing_enable; saved/restored with the other row-gather words), block 0
 // thread 0 of a mode-1 (MoE) request records %globaltimer stamps into a ring at control +
-// PCI_CLUSTER_WTIMING_OFF: 512 records x 64 B = 32 KiB at 0x38000-0x3FFFF, inside the owner-BAR exposure
-// (0x40000) and outside the control struct (< 0xB000), the direct result (0x20000) and the leader-
-// aggregation window (0x28000-0x37FFF). M10 clock: compare durations, not absolute times, with the RTX.
-#define PCI_CLUSTER_WTIMING_OFF 0x38000u
-#define PCI_CLUSTER_WTIMING_RECS 512u
+// PCI_CLUSTER_WTIMING_OFF: 256 records x 64 B = 16 KiB at 0x3C000-0x3FFFF, inside the owner-BAR exposure
+// (0x40000) and outside the control struct (< 0xB000), the direct result (0x20000), the leader-aggregation
+// slots (0x28000-0x32803) and the multi-row leader slots (0x33000-0x3BFFF, resident_multirow_abi.cuh;
+// 2026-11-04: the ring moved from 0x38000 / 512 records to make room for them).
+// M10 clock: compare durations, not absolute times, with the RTX.
+#define PCI_CLUSTER_WTIMING_OFF 0x3C000u
+#define PCI_CLUSTER_WTIMING_RECS 256u
 struct PciClusterWorkerTiming {
     unsigned seq, layer, role, kind;       // kind 1 = routed, 2 = shared
     unsigned long long t_seen, t_checked, t_gateup, t_down, t_done, t_extra;   // t_extra: kind-specific (kind 3: see routed mode 8)

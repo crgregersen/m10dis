@@ -47,7 +47,7 @@ for g, row in enumerate(rows):
     assert plan["base"] == int(row[6], 0) and plan["window"] == 65536
 s = json.loads(subprocess.check_output([sys.executable, str(root / "src/qwen38_resident_daemon.py"),
                                         "status", "--control-socket", str(sock)], text=True))
-assert s["status"] == "READY" and s["layers_ready"] == 48, s.get("layers_ready")
+assert s["status"] == "READY" and s["layers_ready"] in (48, 49), s.get("layers_ready")
 assert s["worker_activity"] == "PARKED"
 assert s["direct_moe_setup"]["gpu_map_records"] == 24
 assert s["multicast_snapshot_root"] == str(snapshots)
@@ -100,6 +100,23 @@ if [[ ${Q38_PYSPY_SECONDS:-0} -gt 0 ]]; then
   PYSPY_PID=$!
 fi
 
+# Optional Nsight Systems trace of steady decode (Q38_NSYS=1, 2026-11-04): the client runs under `nsys profile`
+# (CUDA + NVTX, CUDA graphs traced per node, children followed). Collection is the cudaProfilerApi range the
+# adapter opens at decode token Q38_CUDA_PROFILER_START_TOKENS (default 500) for Q38_CUDA_PROFILER_TOKENS
+# (default 200). No --duration and no --kill: the nsys session lives as long as the client, so the wrapper's
+# cleanup order is unchanged. (v2/v3 used --delay/--duration --kill=none: the CLI returned while the client still
+# ran, and the client then hung at exit holding the ACS lock. Never use that mode here.)
+# Report: $OUT/nsys-decode.nsys-rep.
+NSYS_PREFIX=()
+if [[ ${Q38_NSYS:-0} == 1 ]]; then
+  export Q38_CUDA_PROFILER_START_TOKENS=${Q38_CUDA_PROFILER_START_TOKENS:-500}
+  export Q38_CUDA_PROFILER_TOKENS=${Q38_CUDA_PROFILER_TOKENS:-200}
+  NSYS_PREFIX=(nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --trace-fork-before-exec=true
+    --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop
+    --output="$OUT/nsys-decode" --force-overwrite=true)
+  echo "NSYS,profile,start_tokens,$Q38_CUDA_PROFILER_START_TOKENS,tokens,$Q38_CUDA_PROFILER_TOKENS"
+fi
+
 set +e
 env CUDA_HOME=/usr/local/cuda-12.4 PYTHONPATH="$ROOT/src" \
   Q38_RTX_BDF="$Q38_RTX_BDF" Q38_RTX_UUID="$Q38_RTX_UUID" \
@@ -118,7 +135,7 @@ env CUDA_HOME=/usr/local/cuda-12.4 PYTHONPATH="$ROOT/src" \
   Q38_RTX_PEER_GPU_DRIVEN="${Q38_RTX_PEER_GPU_DRIVEN:-0}" \
   Q38_RTX_PEER_PLE_GPU="${Q38_RTX_PEER_PLE_GPU:-0}" \
   bash -c 'ulimit -c 0; exec "$@"' _ \
-  "$PYTHON" -u "$ROOT/src/run_vllm_resident_m10_client.py" \
+  "${NSYS_PREFIX[@]}" "$PYTHON" -u "$ROOT/src/run_vllm_resident_m10_client.py" \
     --model "$MODEL" --moe-socket "$MOE_SOCKET" --ple-socket "$PLE_SOCKET" --control-socket "$SOCKET" \
     --out "$OUT/vllm" --prompt-file "$PROMPT" \
     --max-model-len "${Q38_VLLM_MAX_MODEL_LEN:-512}" --max-new-tokens "${Q38_VLLM_MAX_NEW_TOKENS:-220}" \
@@ -129,6 +146,16 @@ env CUDA_HOME=/usr/local/cuda-12.4 PYTHONPATH="$ROOT/src" \
     --park-workers-on-exit \
     > "$OUT/client.log" 2>&1
 client_rc=$?
+if [[ ${#NSYS_PREFIX[@]} -gt 0 ]]; then
+  # Backstop: never continue to cleanup while the real client (its MainProcess pid from the log) still runs.
+  cpid=$(grep -ao 'MainProcess pid=[0-9]*' "$OUT/client.log" | head -1 | cut -d= -f2 || true)
+  waited=0
+  while [[ -n $cpid ]] && grep -qa run_vllm_resident_m10_client.py "/proc/$cpid/cmdline" 2>/dev/null; do
+    [[ $waited -ge 900 ]] && { echo "NSYS_CLIENT_STILL_RUNNING,pid,$cpid,after_s,$waited"; break; }
+    sleep 2; waited=$((waited + 2))
+  done
+  echo "NSYS_CLIENT_WAIT,pid,${cpid:-none},seconds,$waited,nsys_rc,$client_rc"
+fi
 set -e
 kill "$SAMPLER" 2>/dev/null || true; wait "$SAMPLER" 2>/dev/null || true
 # The recorder usually exits on its own before the client does; kill/cat must not trip set -e

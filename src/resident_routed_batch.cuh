@@ -13,6 +13,7 @@
 // its peers' flags, adds their rows and leaves the sum in its own area. Workers without aggregation are
 // their own reducers. The RTX reads only the reducers' areas.
 #pragma once
+#include "resident_multirow_abi.cuh"   // Q38_LAYERS_WITH_MTP
 #include "resident_batch_layout.cuh"
 
 
@@ -53,7 +54,7 @@ template <class Control>
 __device__ unsigned q38_batch_validate_routed(const Control *c, unsigned layer, int E, unsigned R, unsigned max_rows, unsigned slot) {
     const volatile Control *v = c;
     if (R < 1 || R > max_rows || !v->batch_area || v->cpu_mailbox_worker >= Q38_CPU_MAILBOX_WORKERS ||
-        !(v->cpu_mailbox_reserved & Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN) || layer >= 48 ||
+        !(v->cpu_mailbox_reserved & Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN) || layer >= Q38_LAYERS_WITH_MTP ||
         !v->batch_scratch || v->batch_scratch_bytes < Q38_BATCH_SCRATCH_BYTES)
         return Q38_BATCH_REASON_CONFIG;
     const char *bt = q38_batch_area(c);

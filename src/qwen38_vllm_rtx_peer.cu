@@ -10,6 +10,7 @@
 #include "pci_cluster_exchange.cuh"
 #include "resident_batch_layout.cuh"
 #include "resident_cpu_mailbox_abi.cuh"
+#include "resident_multirow_abi.cuh"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstddef>
@@ -47,12 +48,12 @@ constexpr NvU32 kReturnWindowBytes = kReturnSpanBytes < (64u << 10) ? (64u << 10
 constexpr NvU32 kReturnSlotBytes = 256u << 10;
 constexpr NvU32 kAsyncStatusSlots = 64;
 constexpr NvU32 kPexGroups = 6;
-constexpr NvU32 kPexPagesPerGroup = 4;
+constexpr NvU32 kPexPagesPerGroup = 7;   // + 0xC000..0xEFFF (multi-row rows 2-3, 2026-11-04)
 constexpr NvU32 kPexAliases = kPexGroups * kPexPagesPerGroup;
 constexpr NvU32 kPexWindowBytes = 64u << 10;
 constexpr NvU32 kPexLeafBytes = 64u << 10;
 constexpr NvU32 kPexPageBytes = PAGE;
-constexpr NvU32 kPexPageOffsets[kPexPagesPerGroup] = {0, 0x8000, 0x9000, 0xA000};
+constexpr NvU32 kPexPageOffsets[kPexPagesPerGroup] = {0, 0x8000, 0x9000, 0xA000, 0xC000, 0xD000, 0xE000};
 #ifdef Q38_RTX_PEER_SMALL_LEAVES
 constexpr NvU32 kPexRemapBytes = PAGE;                    // one 4-KiB leaf per used page
 constexpr NvU32 kPexRemapsPerGroup = kPexPagesPerGroup;
@@ -78,7 +79,8 @@ constexpr NvU32 kControlRoutesOff = offsetof(PeerControlLayout, routes);
 constexpr NvU32 kControlHOff = offsetof(PeerControlLayout, x);
 constexpr NvU32 kDirectResultOff = Q38_DIRECT_RESULT_OFF;
 #ifdef Q38_RTX_PEER_LEADER_AGG
-// Leader aggregation slots/flags live at owner +0x28000..0x38000, inside the daemon's
+// Leader aggregation slots/flags live at owner +0x28000..0x32803 (row-1 slots of the multi-row mode at
+// 0x33000..0x3BFFF, worker timing ring at 0x3C000), inside the daemon's
 // 0x40000-byte worker BAR1 exposure (resident_direct_mailbox.cuh).
 constexpr size_t kOwnerDiagnosticMapBytes = Q38_WORKER_BAR_MAP_BYTES;
 #else
@@ -155,6 +157,12 @@ struct PeerState {
     NvU32 *device_headers = nullptr;
     NvU64 *device_return_slots = nullptr;
     NvU64 *device_m10_return_aliases = nullptr;
+    // Multi-row decode MoE (worker mode 10, Q38_RTX_PEER_MOE_MULTIROW=1 at open, resident_multirow_abi.cuh):
+    // row-1 return records of the 9 reducers (card leaders, shared workers), 0 for the card peers.
+    bool multirow = false;
+    NvU32 mr_max_rows = 0;               // Q38_RTX_PEER_MOE_MULTIROW_MAX (2..4, default 2): rows the routes cover
+    std::vector<NvU64> return_slots1;    // [(r-1)*24 + w], r = 1 .. mr_max_rows-1
+    NvU64 *device_return_slots1 = nullptr;
     std::vector<PeerRecord> workers;
     std::vector<MultiRoute> routes;
     std::vector<MultiRoute> return_routes;
@@ -432,6 +440,9 @@ __device__ __forceinline__ static volatile NvU32 *rtx_pex_word(
     } else if (byte_offset >= 0x8000 && byte_offset < 0xB000) {
         page = 1 + (byte_offset - 0x8000) / kPexPageBytes;
         logical_page_base = 0x8000 + (page - 1) * kPexPageBytes;
+    } else if (byte_offset >= 0xC000 && byte_offset < 0xF000) {      // alias 4..6 -> mailbox [0xC000,0xF000)
+        page = 4 + (byte_offset - 0xC000) / kPexPageBytes;
+        logical_page_base = 0xC000 + (page - 4) * kPexPageBytes;
     } else {
         asm volatile("trap;");
         return nullptr;
@@ -752,7 +763,8 @@ __global__ static void rtx_peer_reduce(const NvU64 *return_slots,NvU32 workers,
 // Phase 2: GPU-driven exchange. Every step is stream work, so the whole MoE call can be captured
 // into a CUDA graph and replayed without host involvement. Error reasons (err_reason):
 //   1 cycle timeout, 2 wall-clock deadline (%globaltimer), 3 host abort flag, 4 worker error status,
-//   5 header mismatch (seq/ready), 6 sequence space exhausted.
+//   5 header mismatch (seq/ready), 6 sequence space exhausted; per-op reasons 7..11 (row gather, LM head, batch)
+//   and 12 (multi-row: a reducer's row-1 record did not acknowledge, PciClusterMoe2Op).
 __device__ __forceinline__ unsigned long long q38_globaltimer() {
     unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
 }
@@ -903,6 +915,10 @@ __global__ static void pci_cluster_wait_combine(const PeerState::GpuDev *d, Peer
     if (threadIdx.x == 0) { PciClusterTimingRec *r = pc_rec(d); if (r) r->t_done = q38_globaltimer(); }
 }
 
+// MoE wait + combine block size (2026-11-04: 256 -> 1024). Each thread sums whole output elements in the
+// fixed worker order, so the block size does not change any result; more threads overlap the slot reads
+// (mode 1: 9.2 us, mode 10 two rows: 28.7 us with 256 threads).
+constexpr unsigned kMoeCombineThreads = 1024;
 // Op: MoE (worker mode 1). Every worker computes its own experts for the broadcast hidden state;
 // combine = sum of the 20 routed slots + shared gate * sum of the 4 shared slots.
 struct PciClusterMoeOp {
@@ -952,6 +968,75 @@ struct PciClusterMoeOp {
         }
     }
 };
+
+#ifdef Q38_RTX_PEER_LEADER_AGG
+// Op: multi-row decode MoE (worker mode 10, resident_multirow_abi.cuh; 2026-11-04). R = 1..2 BF16 rows in ONE
+// multicast request; per row PciClusterMoeOp's combine (same order), row 1 from the reducers' second return
+// records. A dummy row (an id outside [0, 512)) is sent as ids 0..9 with routes 0 and gives a zero output row.
+// Error reason 12: a reducer's row-1 record does not acknowledge the request (header seq / status / ready).
+struct PciClusterMoe2Op {
+    // rows 1..4 (rows <= the max rows configured at open); slots1[(r-1)*24 + w] = row-r record of worker w (reducers)
+    struct Args { const void *h; const int32_t *ids; const float *routes; float *out; NvU32 rows;
+                  const NvU64 *slots1; const PeerState::GpuDev *d; PeerState::GpuHost *hst; NvU32 layer; };
+    static constexpr NvU32 kMode = Q38_MR_MODE;
+    __device__ static bool dummy(const Args &a, NvU32 r) {
+        for (int k = 0; k < 10; k++) { const int e = a.ids[r * 10 + k]; if (e < 0 || e >= 512) return true; }
+        return false;
+    }
+    __device__ static NvU32 skip(const Args &a) {
+        for (NvU32 r = 0; r < a.rows; r++) if (!dummy(a, r)) return 0;
+        return 1;
+    }
+    __device__ static void publish(const Args &a, const NvU64 *aliases, NvU32 group) {
+        const NvU32 *hw = reinterpret_cast<const NvU32 *>(a.h);
+        for (NvU32 r = 0; r < a.rows; r++)
+            for (NvU32 i = threadIdx.x; i < QWEN_H / 2; i += blockDim.x)
+                *rtx_pex_word(aliases, group, q38_mr_x_off(r) + i * sizeof(NvU32)) = hw[r * (QWEN_H / 2) + i];
+        if (threadIdx.x == 0) {
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, reserved)) = 1u;      // BF16 x
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, ple_count)) = a.rows;
+        }
+        for (NvU32 t = threadIdx.x; t < a.rows * 10; t += blockDim.x) {
+            const NvU32 r = t / 10, k = t % 10;
+            const bool dm = dummy(a, r);
+            *rtx_pex_word(aliases, group, q38_mr_ids_off(r) + k * sizeof(NvS32)) = dm ? k : NvU32(a.ids[t]);
+            *rtx_pex_word(aliases, group, q38_mr_routes_off(r) + k * sizeof(float)) = dm ? 0u : __float_as_uint(a.routes[t]);
+        }
+    }
+    __device__ static void zero(const Args &a) {
+        for (NvU32 j = threadIdx.x; j < a.rows * QWEN_H; j += blockDim.x) a.out[j] = 0.0f;
+    }
+    __device__ static void combine(const Args &a, const NvU64 *return_slots) {
+        __shared__ NvU32 ok;
+        const NvU32 skipmask = g_q38_agg_skip_mask;
+        if (threadIdx.x == 0) {
+            ok = 1;
+            const NvU32 seq = static_cast<const volatile PeerState::GpuDev *>(a.d)->cur_seq;
+            for (NvU32 r = 1; r < a.rows && ok; r++)
+                for (NvU32 w = 0; w < 24 && ok; w++) {
+                    if (w < 20 && ((skipmask >> w) & 1u)) continue;
+                    const NvU64 s1 = a.slots1[(r - 1) * 24 + w];
+                    const volatile NvU32 *h = reinterpret_cast<const volatile NvU32 *>(s1);
+                    if (!s1) { ok = 0; q38_gpu_fail(a.hst, 12, a.layer, seq, w, r, 0); }
+                    else if (h[0] != seq || h[1] != 0 || h[2] != 0 || h[3] != 1) { ok = 0; q38_gpu_fail(a.hst, 12, a.layer, seq, w + 32 * r, h[1], h[0]); }
+                }
+        }
+        __syncthreads();
+        if (!ok) { zero(a); return; }
+        for (NvU32 row = 0; row < a.rows; row++) {
+            const NvU64 *slots = row ? a.slots1 + (row - 1) * 24 : return_slots;
+            const float gate = *reinterpret_cast<const volatile float *>(slots[20] + offsetof(ResidentDirectResult, gate));
+            const bool dm = dummy(a, row);
+            for (NvU32 j = threadIdx.x; j < QWEN_H; j += blockDim.x) {
+                float routed = 0.0f, shared = 0.0f;
+                for (NvU32 w = 0; w < 20; w++) if (!((skipmask >> w) & 1u)) routed += reinterpret_cast<const volatile float *>(slots[w] + offsetof(ResidentDirectResult, result))[j];
+                for (NvU32 w = 20; w < 24; w++) shared += reinterpret_cast<const volatile float *>(slots[w] + offsetof(ResidentDirectResult, result))[j];
+                a.out[row * QWEN_H + j] = dm ? 0.0f : routed + gate * shared;
+            }
+        }
+    }
+};
+#endif
 
 // Op: row gather (worker mode 6). The RTX resolves every global row to (owner worker, byte offset)
 // in skip() (one thread, <= 64 rows, binary search over the shard table), broadcasts the descriptors,
@@ -1017,21 +1102,33 @@ struct PciClusterRowGatherOp {
 // log-sum-exp. combine: check every count (= min(K, rows)), fill the logits row with -inf, scatter the
 // candidates to row_start + index, and combine the 24 log-sum-exps (written to lse_out).
 // Error reason 10: a worker's candidate count differs from the request.
+// nrows 2 (2026-11-04, MTP verify): two BF16 rows in one request (PCI_CLUSTER_LM_FMT_BF16X2); out / lse_out hold
+// nrows rows (vocab BF16 logits, one log-sum-exp each).
+static_assert(PCI_CLUSTER_LM_X1_OFF == Q38_MR_X1_OFF, "LM-head row 1 uses the multi-row x offset");
 struct PciClusterLmHeadOp {
     struct Args { const void *x; int x_type; NvU16 *out; NvU32 vocab, k; const NvU64 *off, *rows; const NvU32 *row_start;
-                  float *lse_out; PeerState::GpuHost *hst; NvU32 layer; };
+                  float *lse_out; PeerState::GpuHost *hst; NvU32 layer; NvU32 nrows = 1; };
     static constexpr NvU32 kMode = PCI_CLUSTER_MODE_LM_TOPK;
     __device__ static NvU32 skip(const Args &) { return 0; }
     __device__ static void publish(const Args &a, const NvU64 *aliases, NvU32 group) {
         PciClusterMoeOp::Args h{a.x, a.x_type, nullptr, nullptr, nullptr};
         const __half *h16 = reinterpret_cast<const __half *>(h.h);
         const __nv_bfloat16 *hb = reinterpret_cast<const __nv_bfloat16 *>(h.h);
+        if (a.nrows >= 2) {                                   // N BF16 rows as raw words (exact)
+            const NvU32 *hw = reinterpret_cast<const NvU32 *>(a.x);
+            for (NvU32 r = 0; r < a.nrows; r++)
+                for (NvU32 i = threadIdx.x; i < QWEN_H / 2; i += blockDim.x)
+                    *rtx_pex_word(aliases, group, pci_cluster_lm_x_off(r) + i * sizeof(NvU32)) = hw[r * (QWEN_H / 2) + i];
+        } else
         for (NvU32 i = threadIdx.x; i < QWEN_H; i += blockDim.x) {
             const float value = h.h_type == 0 ? reinterpret_cast<const float *>(h.h)[i]
                              : h.h_type == 1 ? __half2float(h16[i]) : __bfloat162float(hb[i]);
             *rtx_pex_word(aliases, group, kControlHOff + i*sizeof(NvU32)) = __float_as_uint(value);
         }
-        if (threadIdx.x == 0) *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, ple_count)) = a.k;
+        if (threadIdx.x == 0) {
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, ple_count)) = a.k;
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, reserved)) = a.nrows >= 2 ? a.nrows : 0u;
+        }
         for (NvU32 w = threadIdx.x; w < 24; w += blockDim.x) {
             const NvU32 o = offsetof(PeerControlLayout, ple_offsets) + w * 16;
             *rtx_pex_word(aliases, group, o) = NvU32(a.off[w]);       *rtx_pex_word(aliases, group, o + 4) = NvU32(a.off[w] >> 32);
@@ -1039,31 +1136,40 @@ struct PciClusterLmHeadOp {
         }
     }
     __device__ static void zero(const Args &a) {          // failed call: all-zero logits (error is sticky)
-        for (NvU32 j = threadIdx.x; j < a.vocab / 2; j += blockDim.x) reinterpret_cast<NvU32 *>(a.out)[j] = 0;
+        for (NvU32 j = threadIdx.x; j < a.nrows * a.vocab / 2; j += blockDim.x) reinterpret_cast<NvU32 *>(a.out)[j] = 0;
+    }
+    // Row r of worker w: count at result word r*(k+1), candidates after it; LSE in gate (row 0) or word LSE1 (row 1).
+    __device__ static float lse_of(const NvU64 slot, NvU32 row) {
+        return row ? reinterpret_cast<const volatile float *>(slot + offsetof(ResidentDirectResult, result))[PCI_CLUSTER_LM_LSE1_WORD - (row - 1)]
+                   : *reinterpret_cast<const volatile float *>(slot + offsetof(ResidentDirectResult, gate));
     }
     __device__ static void combine(const Args &a, const NvU64 *return_slots) {
         __shared__ NvU32 ok;
         if (threadIdx.x == 0) {
-            ok = 1; float m = -INFINITY;
-            for (NvU32 w = 0; w < 24 && ok; w++) {
-                const auto *r = reinterpret_cast<const volatile NvU32 *>(return_slots[w] + offsetof(ResidentDirectResult, result));
-                const NvU32 want = a.k < a.rows[w] ? a.k : NvU32(a.rows[w]);
-                if (r[0] != want) { ok = 0; q38_gpu_fail(a.hst, 10, a.layer, 0, w, r[0], want); }
-                m = fmaxf(m, *reinterpret_cast<const volatile float *>(return_slots[w] + offsetof(ResidentDirectResult, gate)));
-            }
-            if (ok) {
-                float s = 0.0f;
-                for (NvU32 w = 0; w < 24; w++) s += expf(*reinterpret_cast<const volatile float *>(return_slots[w] + offsetof(ResidentDirectResult, gate)) - m);
-                if (a.lse_out) *a.lse_out = m + logf(s);
+            ok = 1;
+            for (NvU32 row = 0; row < a.nrows && ok; row++) {
+                float m = -INFINITY;
+                for (NvU32 w = 0; w < 24 && ok; w++) {
+                    const auto *r = reinterpret_cast<const volatile NvU32 *>(return_slots[w] + offsetof(ResidentDirectResult, result));
+                    const NvU32 want = a.k < a.rows[w] ? a.k : NvU32(a.rows[w]);
+                    if (r[row * (a.k + 1)] != want) { ok = 0; q38_gpu_fail(a.hst, 10, a.layer, row, w, r[row * (a.k + 1)], want); }
+                    m = fmaxf(m, lse_of(return_slots[w], row));
+                }
+                if (ok) {
+                    float s = 0.0f;
+                    for (NvU32 w = 0; w < 24; w++) s += expf(lse_of(return_slots[w], row) - m);
+                    if (a.lse_out) a.lse_out[row] = m + logf(s);
+                }
             }
         }
         __syncthreads();
         if (!ok) { zero(a); return; }
-        for (NvU32 j = threadIdx.x; j < a.vocab / 2; j += blockDim.x) reinterpret_cast<NvU32 *>(a.out)[j] = 0xff80ff80u;   // BF16 -inf
+        for (NvU32 j = threadIdx.x; j < a.nrows * a.vocab / 2; j += blockDim.x) reinterpret_cast<NvU32 *>(a.out)[j] = 0xff80ff80u;   // BF16 -inf
         __syncthreads();
+        for (NvU32 row = 0; row < a.nrows; row++)
         for (NvU32 w = 0; w < 24; w++) {
-            const auto *r = reinterpret_cast<const volatile NvU32 *>(return_slots[w] + offsetof(ResidentDirectResult, result));
-            const NvU32 n = r[0], base = a.row_start[w];
+            const auto *r = reinterpret_cast<const volatile NvU32 *>(return_slots[w] + offsetof(ResidentDirectResult, result)) + row * (a.k + 1);
+            const NvU32 n = r[0], base = row * a.vocab + a.row_start[w];
             for (NvU32 i = threadIdx.x; i < n; i += blockDim.x) { const NvU32 e = r[1 + i]; a.out[base + (e & 0xffffu)] = NvU16(e >> 16); }
         }
     }
@@ -1277,6 +1383,8 @@ static void cleanup_peer_state(PeerState &s) {
     s.lm_off=nullptr;s.lm_rows=nullptr;s.lm_row_start=nullptr;s.lm_configured=false;
     s.gpu_dev=nullptr;s.gpu_host=s.gpu_host_dev=nullptr;
     if(s.device_return_slots)cudaFree(s.device_return_slots);
+    if(s.device_return_slots1)cudaFree(s.device_return_slots1);
+    s.device_return_slots1=nullptr; s.multirow=false; s.mr_max_rows=0;
     if(s.device_m10_return_aliases)cudaFree(s.device_m10_return_aliases);
     if(s.device_pex_aliases)cudaFree(s.device_pex_aliases);
     if(s.host_alias_alloc)cudaFreeHost(s.host_alias_alloc);
@@ -1474,6 +1582,17 @@ static void peer_open(const char *rtx_bdf,const char *maps_path,const char *uuid
     if (use_pex_multicast || use_direct_unicast)
         setup_pex_routes(*s, std::getenv("Q38_M10_GROUPS_TSV"), request_alias_pdb);
     s->routes.resize(24);s->return_routes.resize(24);s->sequence.resize(24);s->owner_fds.assign(24,-1);s->owner_cpus.assign(24,MAP_FAILED);
+    {const char *mr=std::getenv("Q38_RTX_PEER_MOE_MULTIROW"); s->multirow=mr&&std::strcmp(mr,"1")==0;
+     const char *mx=std::getenv("Q38_RTX_PEER_MOE_MULTIROW_MAX"); s->mr_max_rows=s->multirow?(mx&&*mx?NvU32(std::atoi(mx)):2u):0u;
+     if(s->multirow&&(s->mr_max_rows<2||s->mr_max_rows>Q38_MR_MAX_ROWS))throw std::runtime_error("Q38_RTX_PEER_MOE_MULTIROW_MAX must be 2..4");}
+    s->return_slots1.assign(size_t(24)*(Q38_MR_MAX_ROWS-1),0);
+#if !defined(Q38_RTX_PEER_SMALL_LEAVES) || !defined(Q38_RTX_PEER_LEADER_AGG)
+    if(s->multirow)throw std::runtime_error("Q38_RTX_PEER_MOE_MULTIROW needs the small-leaf leader-aggregation build");
+#else
+    static_assert(kReturnPages*kReturnLeafBytes==Q38_MR_RECORD_SHIFT,"row-1 record shift must equal one return record");
+#endif
+    if(s->multirow&&(!use_pex_multicast||s->ingress_diagnostic))
+        throw std::runtime_error("Q38_RTX_PEER_MOE_MULTIROW needs the PEX multicast path");
     s->return_slots.resize(24);
     s->saved_mailbox_fields.resize(24);
     for(size_t i=0;i<24;i++) {
@@ -1540,20 +1659,37 @@ static void peer_open(const char *rtx_bdf,const char *maps_path,const char *uuid
         if (owner_window_offset + kReturnWindowBytes > slot_offset + kReturnSlotBytes ||
             owner_window_offset + kReturnWindowBytes > s->return_owner.map_bytes)
             throw std::runtime_error("aligned RTX return window exceeds its reserved 256-KiB slot");
+        // Mode 10 (Q38_RTX_PEER_MOE_MULTIROW, N = Q38_RTX_PEER_MOE_MULTIROW_MAX rows): the 9 reducers (card leaders
+        // 0,4,..,16 and shared workers 20..23) get N return records in the same route (3N pages): record r at row 0 +
+        // r * 3 pages; backwards (row 0 - r * 3 pages) where the next VA pages are the mode-8 request area (worker 23,
+        // and 22 for N >= 3). Card peers keep 3 pages (header only).
+        const NvU32 mr_n = s->mr_max_rows;
+        const bool mr_reducer = s->multirow && ((i < 20 && i % 4 == 0) || i >= 20);
+        const bool mr_back = mr_reducer && (i == 23 || (i == 22 && mr_n >= 3));
+        const NvU32 return_pages = mr_reducer ? mr_n * kReturnPages : kReturnPages;
+        const NvU64 return_span = NvU64(return_pages) * kReturnLeafBytes;
+        const NvU64 back_shift = mr_back ? NvU64(mr_n - 1) * Q38_MR_RECORD_SHIFT : 0;
+        const NvU64 route_va = return_leaf_va - back_shift;
+        if (return_span > kReturnWindowBytes)
+            throw std::runtime_error("multi-row return records exceed the retained RTX return window");
         multi_route_setup(s->return_routes[i],s->uvm_fd,r.uuid,s->rtx_uuid,
-            s->return_owner,return_leaf_va,0,nullptr,owner_window_offset,kReturnWindowBytes,kReturnPages,
+            s->return_owner,route_va,0,nullptr,owner_window_offset,kReturnWindowBytes,return_pages,
             &worker_return_pdb,kReturnLeafBytes,true,use_owner_bus_address);
         if(s->return_routes[i].owner_offset < slot_offset ||
-           s->return_routes[i].owner_offset-slot_offset > kReturnSlotBytes-kReturnSpanBytes ||
-           s->return_routes[i].owner_offset+kReturnSpanBytes > s->return_owner.map_bytes)
+           s->return_routes[i].owner_offset-slot_offset > kReturnSlotBytes-return_span ||
+           s->return_routes[i].owner_offset+return_span > s->return_owner.map_bytes)
             throw std::runtime_error("aligned M10→RTX result slot exceeds RTX BAR1 allocation");
-        s->return_slots[i]=s->return_owner.va+s->return_routes[i].owner_offset+return_leaf_offset;
+        s->return_slots[i]=s->return_owner.va+s->return_routes[i].owner_offset+return_leaf_offset+back_shift;
+        if (mr_reducer)
+            for (NvU32 rr = 1; rr < mr_n; rr++)
+                s->return_slots1[size_t(rr - 1) * 24 + i] = mr_back ? s->return_slots[i] - NvU64(rr) * Q38_MR_RECORD_SHIFT
+                                                                    : s->return_slots[i] + NvU64(rr) * Q38_MR_RECORD_SHIFT;
         std::fprintf(stderr,"RTX_PEER_PUSH,bdf,%s,requester_alias_va,0x%llx,requester_leaf_va,0x%llx,leaf_offset,0x%llx,owner_bar_bus_leaf,0x%llx,owner_offset,0x%llx,rtx_local_va,0x%llx,pages,%u,leaf_bytes,0x%x,writable,1\n",
             r.bdf.c_str(),(unsigned long long)r.return_alias_va,
             (unsigned long long)return_leaf_va,(unsigned long long)return_leaf_offset,
             (unsigned long long)(s->return_owner.rmmap.addr+s->return_routes[i].owner_offset),
             (unsigned long long)s->return_routes[i].owner_offset,
-            (unsigned long long)s->return_slots[i],(unsigned)kReturnPages,(unsigned)kReturnLeafBytes);
+            (unsigned long long)s->return_slots[i],(unsigned)return_pages,(unsigned)kReturnLeafBytes);
 
         // The worker's mailbox pointer is its original mapped-host CUDA VA,
         // and the guarded return PTE above now makes that VA target this
@@ -1656,6 +1792,55 @@ static void peer_open(const char *rtx_bdf,const char *maps_path,const char *uuid
         }
         if(mask){CK(cudaMemcpyToSymbol(g_q38_agg_skip_mask,&mask,sizeof(mask)));s->agg_skip_mask=mask;}
         std::fprintf(stderr,"RTX_PEER_AGG_READY,cards,%zu,peer_routes,%zu,skip_mask,0x%x\n",cards.size(),s->agg_routes.size(),mask);
+        if(s->multirow){
+            // Mode 10 (resident_multirow_abi.cuh), N = mr_max_rows: every routed card aggregated; each peer pushes rows
+            // 1..N-1 packed (10,244 B each) through ONE route of ceil((N-1)*10244/4 KiB) leaves (its VA: slot P+2) into
+            // the leader's block Q38_MR_PEER_BASE(pi-1); every worker gets its multi-row block (role | N << 8; saved /
+            // restored with the aggregation words).
+            std::vector<int> sorted_cards=cards; std::sort(sorted_cards.begin(),sorted_cards.end());
+            if(sorted_cards!=std::vector<int>{0,1,2,3,4})
+                throw std::runtime_error("Q38_RTX_PEER_MOE_MULTIROW needs Q38_RTX_PEER_AGG_CARDS=0,1,2,3,4");
+            const NvU32 N=s->mr_max_rows;
+            const NvU32 push_pages=NvU32(((N-1)*Q38_MR_PUSH_ROW_BYTES+PAGE-1)/PAGE);
+            static_assert(kAggSlotOff+2*kAggSlotStride+Q38_CPU_MAILBOX_HIDDEN*4+8<=Q38_MR_PEER_BASE(2),"peer block 2 overlaps the row-0 slots");
+            static_assert(Q38_MR_PEER_BASE(2)+Q38_MR_PEER_BLOCK_BYTES<=PCI_CLUSTER_WTIMING_OFF,"peer block 2 overlaps the worker timing ring");
+            static_assert(Q38_MR_PEER_BASE(1)+Q38_MR_PEER_BLOCK_BYTES<=Q38_DIRECT_RESULT_OFF,"peer block 1 overlaps the direct record");
+            static_assert(Q38_MR_BLOCK_OFF>=kAggBlockOff+32&&Q38_MR_BLOCK_OFF+sizeof(Q38MrBlock)<=kAggBlockOff+PAGE,"multi-row block overlaps the aggregation block");
+            const NvU32 step=NvU32(Q38_MR_RECORD_SHIFT), back_step=NvU32(0u-Q38_MR_RECORD_SHIFT);
+            auto back=[&](size_t w){return w==23||(w==22&&N>=3);};
+            auto ret1_va=[&](size_t w){return back(w)?s->workers[w].return_alias_va-Q38_MR_RECORD_SHIFT:s->workers[w].return_alias_va+Q38_MR_RECORD_SHIFT;};
+            auto put_mr=[&](size_t w,const Q38MrBlock &b,const char*what){NvU32 v[8];std::memcpy(v,&b,sizeof(v));put(save(w,Q38_MR_BLOCK_OFF),v,what,w);};
+            size_t mr_routes=0;
+            for(int c=0;c<5;c++){
+                const size_t L=size_t(c)*4; const auto &leader=s->workers[L];
+                QMem lw{}; lw.map_bytes=kAggLeaderMap; lw.rmmap.addr=leader.bar_bus;
+                for(int pi=1;pi<=3;pi++){
+                    const size_t P=L+pi; const auto &peer=s->workers[P];
+                    const NvU64 push1_va=peer.return_alias_va+2*Q38_CPU_MAILBOX_SLOT_STRIDE;
+                    const NvU64 base=Q38_MR_PEER_BASE(pi-1), win=base>=0x30000?0x30000:0x0, winlen=base>=0x30000?0x10000:0x20000;
+                    const auto pdb=find_worker_pdb_for_mapped_va(s->uvm_fd,peer.uuid,peer.requester_pdb_candidates,push1_va,peer.bdf);
+                    s->agg_routes.emplace_back(); auto &rt=s->agg_routes.back(); rt.requester_quiesced=true;
+                    multi_route_setup(rt,s->uvm_fd,peer.uuid,leader.uuid,lw,push1_va,base-win,nullptr,
+                        win,winlen,push_pages,&pdb,PAGE,true,use_owner_bus_address);
+                    if(rt.owner_offset!=base)
+                        throw std::runtime_error("multi-row peer block landed at an unexpected leader offset for "+peer.bdf);
+                    put_mr(P,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_PEER|(N<<8),0u,0u,0ull,push1_va},"multi-row peer block");
+                    mr_routes++;
+                    std::fprintf(stderr,"RTX_PEER_MR_ROUTE,card,%d,peer,%s,leader,%s,push1_va,0x%llx,leader_bus,0x%llx,pages,%u,leaf_bytes,4096\n",
+                        c,peer.bdf.c_str(),leader.bdf.c_str(),(unsigned long long)push1_va,(unsigned long long)(leader.bar_bus+rt.owner_offset),push_pages);
+                    for(NvU32 r=1;r<N;r++){const NvU32 z[8]={0,0,0,0,0,0,0,0};
+                        put(save(L,base+NvU64(r-1)*Q38_MR_PUSH_ROW_BYTES+Q38_CPU_MAILBOX_HIDDEN*4),z,"multi-row leader flag",L);}
+                }
+                put_mr(L,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_LEADER|(N<<8),1u,back(L)?back_step:step,ret1_va(L),0ull},"multi-row leader block");
+            }
+            for(size_t w=20;w<24;w++)put_mr(w,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_SHARED|(N<<8),1u,back(w)?back_step:step,ret1_va(w),0ull},"multi-row shared block");
+            for(size_t w=0;w<24;w++){const bool red=(w<20&&w%4==0)||w>=20;
+                for(NvU32 r=1;r<N;r++)if(red!=(s->return_slots1[size_t(r-1)*24+w]!=0))throw std::runtime_error("multi-row return records do not match the reducer set");}
+            CK(cudaMalloc(&s->device_return_slots1,s->return_slots1.size()*sizeof(NvU64)));
+            CK(cudaMemcpy(s->device_return_slots1,s->return_slots1.data(),s->return_slots1.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
+            std::fprintf(stderr,"RTX_PEER_MR_READY,max_rows,%u,row_peer_routes,%zu,push_pages,%u,reducer_records,%u,routes_total,%zu\n",
+                         N,mr_routes,push_pages,9*N,s->agg_routes.size()+24);
+        }
     }
 #endif
     g_peer=std::move(s);
@@ -1831,7 +2016,7 @@ extern "C" int q38_rtx_peer_forward(uint32_t layer,const void*h,int h_type,const
     auto elapsed_us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
     try {
         if(!g_peer)throw std::runtime_error("RTX peer client is not open");
-        if(layer>=48||!h||!ids||!routes||!out||h_type<0||h_type>2)throw std::runtime_error("invalid RTX peer forward arguments");
+        if(layer>=Q38_LAYERS_WITH_MTP||!h||!ids||!routes||!out||h_type<0||h_type>2)throw std::runtime_error("invalid RTX peer forward arguments");
         auto&s=*g_peer;
         if (s.ingress_diagnostic != ingress_diagnostic)
             throw std::runtime_error("ingress diagnostic mode changed after peer-open");
@@ -1982,7 +2167,7 @@ extern "C" int q38_rtx_peer_forward_gpu(uint32_t layer,const void*h,int h_type,c
         if(!g_peer)throw std::runtime_error("RTX peer client is not open");
         auto &s=*g_peer;
         if(!s.pex_multicast||!s.gpu_dev)throw std::runtime_error("GPU-driven exchange needs the PEX multicast path");
-        if(layer>=48||!h||!ids||!routes||!out||h_type<0||h_type>2)throw std::runtime_error("invalid RTX peer forward arguments");
+        if(layer>=Q38_LAYERS_WITH_MTP||!h||!ids||!routes||!out||h_type<0||h_type>2)throw std::runtime_error("invalid RTX peer forward arguments");
         if(!s.pending_sequences.empty())throw std::runtime_error("GPU-driven exchange cannot follow a pending async window");
         auto st=reinterpret_cast<cudaStream_t>(stream);
         for(size_t i=0;i<24;i++){s.routes[i].requester_quiesced=false;s.return_routes[i].requester_quiesced=false;}
@@ -1995,10 +2180,47 @@ extern "C" int q38_rtx_peer_forward_gpu(uint32_t layer,const void*h,int h_type,c
         CK(cudaGetLastError());
         pci_cluster_publish_sequence<<<kPexGroups,1,0,st>>>(s.gpu_dev,s.device_pex_aliases,Op::kMode);
         CK(cudaGetLastError());
-        pci_cluster_wait_combine<Op><<<1,256,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
+        pci_cluster_wait_combine<Op><<<1,kMoeCombineThreads,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
                                                      s.device_headers,kWaitCycles,2000000000ull);
         CK(cudaGetLastError());
         return 0;
+    } catch(const std::exception&e) {
+        g_peer_error=e.what(); if(err&&cap)std::snprintf(err,cap,"%s",g_peer_error.c_str()); return 1;
+    }
+}
+// Multi-row decode MoE (worker mode 10): rows 1..2 BF16 rows of h / ids / routes -> out [rows][H] FP32, one
+// exchange (enqueue only, capturable). Needs Q38_RTX_PEER_MOE_MULTIROW=1 at open.
+extern "C" int q38_rtx_peer_moe2_gpu(uint32_t layer,const void*h,int h_type,const int32_t*ids,const float*routes,
+        uint32_t rows,float*out,void*stream,char*err,size_t cap) {
+    std::lock_guard<std::mutex> lock(g_peer_mutex);
+    try {
+#ifdef Q38_RTX_PEER_LEADER_AGG
+        if(!g_peer)throw std::runtime_error("RTX peer client is not open");
+        auto &s=*g_peer;
+        if(!s.pex_multicast||!s.gpu_dev)throw std::runtime_error("GPU-driven exchange needs the PEX multicast path");
+        if(!s.multirow||!s.device_return_slots1)throw std::runtime_error("multi-row exchange is not configured (Q38_RTX_PEER_MOE_MULTIROW=1 at open)");
+        if(layer>=Q38_LAYERS_WITH_MTP||!h||!ids||!routes||!out||h_type!=2||rows<1||rows>s.mr_max_rows)
+            throw std::runtime_error("invalid multi-row forward arguments (BF16 rows 1..max rows, layer < 49)");
+        if(!s.pending_sequences.empty())throw std::runtime_error("GPU-driven exchange cannot follow a pending async window");
+        auto st=reinterpret_cast<cudaStream_t>(stream);
+        for(size_t i=0;i<24;i++){s.routes[i].requester_quiesced=false;s.return_routes[i].requester_quiesced=false;}
+        s.in_flight=true; s.pex_quiesced=false; s.m10_quiesced=false; s.gpu_used=true;
+        using Op=PciClusterMoe2Op;
+        const Op::Args a{h,ids,routes,out,rows,s.device_return_slots1,s.gpu_dev,s.gpu_host_dev,layer};
+        pci_cluster_begin<Op><<<1,32,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,layer);
+        CK(cudaGetLastError());
+        pci_cluster_publish<Op><<<kPexGroups,256,0,st>>>(s.gpu_dev,a,s.device_pex_aliases,layer);
+        CK(cudaGetLastError());
+        pci_cluster_publish_sequence<<<kPexGroups,1,0,st>>>(s.gpu_dev,s.device_pex_aliases,Op::kMode);
+        CK(cudaGetLastError());
+        pci_cluster_wait_combine<Op><<<1,kMoeCombineThreads,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
+                                                     s.device_headers,kWaitCycles,2000000000ull);
+        CK(cudaGetLastError());
+        return 0;
+#else
+        (void)layer;(void)h;(void)h_type;(void)ids;(void)routes;(void)rows;(void)out;(void)stream;
+        throw std::runtime_error("multi-row exchange needs the leader-aggregation build");
+#endif
     } catch(const std::exception&e) {
         g_peer_error=e.what(); if(err&&cap)std::snprintf(err,cap,"%s",g_peer_error.c_str()); return 1;
     }
@@ -2234,8 +2456,15 @@ extern "C" int q38_zero_copy_gather(const void *device_table, unsigned long long
 // Enqueue one LM-head top-k exchange for one row: x (QWEN_H values, h_type 0 f32 / 1 f16 / 2 bf16, device)
 // -> out (vocab BF16 logits: top candidates, -inf elsewhere), lse_out (FP32 global log-sum-exp, may be
 // null). 1 <= k <= 2559. Capturable; failures give zero logits and the sticky error.
+extern "C" int q38_rtx_peer_lm_head_topk_rows(const void *x, int x_type, uint16_t *out, float *lse_out, uint32_t k,
+        uint32_t nrows, uint32_t *vocab_out, void *stream, char *err, size_t cap);
 extern "C" int q38_rtx_peer_lm_head_topk(const void *x, int x_type, uint16_t *out, float *lse_out, uint32_t k,
         uint32_t *vocab_out, void *stream, char *err, size_t cap) {
+    return q38_rtx_peer_lm_head_topk_rows(x, x_type, out, lse_out, k, 1, vocab_out, stream, err, cap);
+}
+// nrows = 2 (2026-11-04): two BF16 rows (x [2][H], out [2][vocab], lse_out [2]) in one exchange; needs 2(k+1) <= 2559.
+extern "C" int q38_rtx_peer_lm_head_topk_rows(const void *x, int x_type, uint16_t *out, float *lse_out, uint32_t k,
+        uint32_t nrows, uint32_t *vocab_out, void *stream, char *err, size_t cap) {
     std::lock_guard<std::mutex> lock(g_peer_mutex);
     try {
         if (!g_peer) throw std::runtime_error("RTX peer client is not open");
@@ -2244,6 +2473,8 @@ extern "C" int q38_rtx_peer_lm_head_topk(const void *x, int x_type, uint16_t *ou
         if (vocab_out) *vocab_out = s.lm_vocab;
         if (!x || !out) return 0;                            // vocab query only
         if (x_type < 0 || x_type > 2 || k < 1 || k > PCI_CLUSTER_LM_MAX_K) throw std::runtime_error("invalid LM-head top-k arguments");
+        if (nrows < 1 || nrows > PCI_CLUSTER_LM_MAX_NROWS || (nrows >= 2 && (x_type != 2 || nrows * (k + 1) > 2560 - nrows)))
+            throw std::runtime_error("N-row LM head needs BF16 rows, N <= 4 and N(k+1) <= 2560 - N");
         if (!s.pending_sequences.empty()) throw std::runtime_error("GPU-driven exchange cannot follow a pending async window");
         auto st = reinterpret_cast<cudaStream_t>(stream);
         for (size_t i = 0; i < 24; i++) { s.routes[i].requester_quiesced = false; s.return_routes[i].requester_quiesced = false; }
@@ -2251,7 +2482,7 @@ extern "C" int q38_rtx_peer_lm_head_topk(const void *x, int x_type, uint16_t *ou
         using Op = PciClusterLmHeadOp;
         constexpr NvU32 kLmLayer = 0x200;                    // error records: "layer 512" = LM head
         const Op::Args a{x, x_type, reinterpret_cast<NvU16 *>(out), s.lm_vocab, k, s.lm_off, s.lm_rows, s.lm_row_start,
-                         lse_out, s.gpu_host_dev, kLmLayer};
+                         lse_out, s.gpu_host_dev, kLmLayer, nrows};
         pci_cluster_begin<Op><<<1, 32, 0, st>>>(s.gpu_dev, s.gpu_host_dev, a, kLmLayer);
         CK(cudaGetLastError());
         pci_cluster_publish<Op><<<kPexGroups, 256, 0, st>>>(s.gpu_dev, a, s.device_pex_aliases, kLmLayer);
@@ -2322,7 +2553,7 @@ extern "C" int q38_rtx_peer_moe_batch_gpu(uint32_t layer, const void *h, int h_t
         if (!g_peer) throw std::runtime_error("RTX peer client is not open");
         auto &s = *g_peer;
         if (!s.batch_dev) throw std::runtime_error("batched MoE is not configured");
-        if (layer >= 48 || !h || !ids || !routes || !out || h_type < 0 || h_type > 2 || rows < 1 || rows > Q38_BATCH_MAX_ROWS)
+        if (layer >= Q38_LAYERS_WITH_MTP || !h || !ids || !routes || !out || h_type < 0 || h_type > 2 || rows < 1 || rows > Q38_BATCH_MAX_ROWS)
             throw std::runtime_error("invalid batched MoE arguments");
         if (!s.pending_sequences.empty()) throw std::runtime_error("GPU-driven exchange cannot follow a pending async window");
         auto st = reinterpret_cast<cudaStream_t>(stream);
@@ -2423,7 +2654,7 @@ extern "C" int q38_rtx_peer_moe_batch_pipe_gpu(uint32_t layer, const void *h, in
         if (!s.batch_dev) throw std::runtime_error("batched MoE is not configured");
         constexpr uint32_t kMaxChunks = 4096;
         const uint32_t n = (rows + Q38_BATCH_PIPE_ROWS - 1) / Q38_BATCH_PIPE_ROWS;
-        if (layer >= 48 || !h || !ids || !routes || !out || h_type < 0 || h_type > 2 || rows < 1 || n > kMaxChunks)
+        if (layer >= Q38_LAYERS_WITH_MTP || !h || !ids || !routes || !out || h_type < 0 || h_type > 2 || rows < 1 || n > kMaxChunks)
             throw std::runtime_error("invalid pipelined batched MoE arguments");
         if (!s.pending_sequences.empty()) throw std::runtime_error("GPU-driven exchange cannot follow a pending async window");
         auto st = reinterpret_cast<cudaStream_t>(stream);
@@ -2592,7 +2823,7 @@ extern "C" int q38_rtx_peer_forward_async(uint32_t layer,const void*h,int h_type
     std::lock_guard<std::mutex> lock(g_peer_mutex);
     try {
         if(!g_peer)throw std::runtime_error("RTX peer client is not open");
-        if(layer>=48||!h||!ids||!routes||!out||h_type<0||h_type>2)
+        if(layer>=Q38_LAYERS_WITH_MTP||!h||!ids||!routes||!out||h_type<0||h_type>2)
             throw std::runtime_error("invalid asynchronous RTX peer forward arguments");
         auto &s=*g_peer;
         auto st=reinterpret_cast<cudaStream_t>(stream);

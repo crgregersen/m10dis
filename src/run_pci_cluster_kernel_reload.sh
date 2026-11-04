@@ -26,7 +26,7 @@ $DAEMON status --control-socket "$CTRL" > "$RUN/daemon-status-before.json"
 python3 - "$RUN/daemon-status-before.json" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s.get("status") == "READY" and s.get("layers_ready") == 48, s.get("status")
+assert s.get("status") == "READY" and s.get("layers_ready") in (48, 49), s.get("status")
 pc = (s.get("peer_client") or {}).get("status")
 assert pc in (None, "NONE"), f"peer client active: {pc}"
 print("DAEMON_BEFORE,pid,%s,activity,%s,kernel_reload,%s" % (s.get("pid"), s.get("worker_activity"), json.dumps(s.get("kernel_reload"))[:300]))
@@ -52,7 +52,7 @@ $DAEMON status --control-socket "$CTRL" > "$RUN/daemon-status-after.json"
 python3 - "$RUN/daemon-status-after.json" "$RUN/build/routed_v3.cubin" "$RUN/build/shared_v2.cubin" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s.get("status") == "READY" and s.get("layers_ready") == 48, s.get("status")
+assert s.get("status") == "READY" and s.get("layers_ready") in (48, 49), s.get("status")
 assert s.get("worker_activity") == "PARKED", s.get("worker_activity")
 kr = json.dumps(s.get("kernel_reload") or {})
 assert sys.argv[2] in kr and sys.argv[3] in kr, "daemon does not record the new images"

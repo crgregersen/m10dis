@@ -104,7 +104,12 @@ def install_model_hooks(adapter: Any, ple_socket: Path | None) -> dict[str, Any]
         if not getattr(_wu, "_q38_skip_installed", False):
             _orig_skip = _wu.should_skip_weight
             _non_rtx = (".mlp.experts.", ".mlp.shared_expert.", ".mlp.shared_expert_gate.",
-                        "ngram_embedding.shard_", "mtp.", "model.visual.")
+                        "ngram_embedding.shard_", "model.visual.")
+            # MTP speculative decoding (Q38_MTP_SPEC_TOKENS > 0, 2026-11-04): the drafter's attention, norms,
+            # fc and hyper-connection tensors load on the RTX; its experts / shared expert are on the M10s
+            # (resident layer 48, skipped by the patterns above). Otherwise the whole MTP head is skipped.
+            if int(os.environ.get("Q38_MTP_SPEC_TOKENS", "0") or 0) <= 0:
+                _non_rtx = _non_rtx + ("mtp.",)
             if os.environ.get("Q38_M10_LM_HEAD") == "1":
                 _non_rtx = _non_rtx + ("lm_head.weight",)      # held by the M10s (PLE owner slices)
             _skip_counts = {"skipped": 0, "kept": 0}
@@ -123,6 +128,15 @@ def install_model_hooks(adapter: Any, ple_socket: Path | None) -> dict[str, Any]
     # Opt-in: embedding / LM head in host RAM (Q38_CPU_EMBEDDING=1, Q38_CPU_LM_HEAD=1).
     from qwen38_cpu_head_hooks import install as install_cpu_heads
     cpu_heads = install_cpu_heads(model_mod)
+    # MTP drafter (vllm.models.qwen4_exp.nvidia.mtp): its own embedding / LM head are replaced by the target's
+    # after loading (vLLM shares them); build them with the same host-table / M10 stand-ins, so the throwaway
+    # copies never allocate 2 x 1.27 GB on the RTX. Its MoE block is Qwen4ExpSparseMoeBlock (patched below),
+    # i.e. the M10 exchange with layer id 48.
+    if int(os.environ.get("Q38_MTP_SPEC_TOKENS", "0") or 0) > 0:
+        mtp_mod = importlib.import_module("vllm.models.qwen4_exp.nvidia.mtp")
+        mtp_mod.VocabParallelEmbedding = model_mod.VocabParallelEmbedding
+        mtp_mod.ParallelLMHead = model_mod.ParallelLMHead
+        cpu_heads["mtp_heads"] = "shared stand-ins"
 
     # Q38_VLLM_CUDAGRAPH=1: the host-side MoE exchange and PLE lookup become eager breaks of
     # vLLM's breakable CUDA graphs (q38_cudagraph_breaks); everything around them is captured.

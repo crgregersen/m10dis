@@ -6,15 +6,129 @@
 #include "resident_shared_v2_math.cuh"
 #include "pci_cluster_exchange.cuh"   // mode 6 row gather (2026-11-03)
 #include "resident_batch_layout.cuh"   // mode 8 batch layout helpers (2026-11-03)
+#include "resident_multirow_abi.cuh"    // mode 10 multi-row decode MoE (2026-11-04)
 #define SHARED_RESIDENT_PLE_ROW_BYTES 160
 #define SHARED_RESIDENT_PLE_MAX_ROWS 4096
 struct SharedResidentControl { volatile unsigned seq,layer,mode,reserved; unsigned ple_count,ple_reserved[3]; unsigned long long ple_offsets[SHARED_RESIDENT_PLE_MAX_ROWS]; int32_t ids[K]; float routes[K]; float x[H]; unsigned cpu_mailbox_worker,cpu_mailbox_reserved; unsigned long long cpu_mailbox_device_ptr; unsigned long long batch_scratch; unsigned batch_scratch_bytes,batch_reserved; unsigned long long batch_area; };  /* batch_*: mode 8 (2026-11-03) */
 struct SharedResidentGrid { unsigned count,generation,error; };
+// Mode 10 checks (thread 0, before any weight access; resident_multirow_abi.cuh): shared workers need a multi-row
+// block with role 3 and (R = 2) a row-1 return record, the RTX return route and the shared scratch.
+__device__ unsigned q38_mr_validate_shared(const SharedResidentControl *c, unsigned layer, unsigned xfmt) {
+ const volatile SharedResidentControl *v=c;
+ const volatile Q38MrBlock *mb=reinterpret_cast<const volatile Q38MrBlock*>(reinterpret_cast<const char*>(c)+Q38_MR_BLOCK_OFF);
+ const unsigned R=v->ple_count;
+ unsigned why=0;
+ if(R<1||R>Q38_MR_MAX_ROWS||R>(mb->role>>8)||xfmt!=1u||layer>=Q38_LAYERS_WITH_MTP||mb->magic!=Q38_MR_MAGIC||(mb->role&0xFFu)!=Q38_MR_ROLE_SHARED||(R>1&&(!mb->ret1_va||!mb->slot1_stride)))why|=Q38_MR_REASON_CONFIG;
+ if(!(v->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)||!v->cpu_mailbox_device_ptr)why|=Q38_MR_REASON_CONFIG;
+ if(!v->batch_scratch||v->batch_scratch_bytes<Q38_SBATCH_SCRATCH_BYTES)why|=Q38_MR_REASON_CONFIG;
+ return why;
+}
 struct SharedResidentReturn { volatile unsigned seq,status,exit_reason,ready; float result[H]; float gate; uint8_t ple_rows[SHARED_RESIDENT_PLE_MAX_ROWS*SHARED_RESIDENT_PLE_ROW_BYTES]; };
 static_assert(sizeof(SharedResidentControl) <= Q38_DIRECT_RESULT_OFF,
               "direct result mailbox overlaps shared command/control payload");
 __device__ bool shared_resident_barrier(SharedResidentGrid*s,unsigned generation){
  __shared__ unsigned failed;__syncthreads();if(!threadIdx.x){__threadfence();auto t=atomicAdd(&s->count,1u);if(t==gridDim.x-1){atomicExch(&s->count,0u);__threadfence();atomicExch(&s->generation,generation);}unsigned long long start=clock64();while(atomicAdd(&s->generation,0u)!=generation&&!atomicAdd(&s->error,0u))if(clock64()-start>1000000000ULL)atomicExch(&s->error,1u);failed=atomicAdd(&s->error,0u);}__syncthreads();return failed==0;
+}
+// Mode 10 (resident_multirow_abi.cuh): R = 1..4 BF16 rows, per row mode 1's arithmetic (hidden2 / hidden4_bfx and
+// down_chunk2 / down_chunkN load each weight vector once for all rows, bit-identical per row). Row 0 as mode 1; rows
+// >= 1: hidden in the shared scratch, gate (worker 0, block r) in the scratch's down area, result + gate to the row-r
+// return record (ret1_va + (r-1) * step). Non-inlined: keeps the mode-1 register allocation.
+template <int N>
+__device__ __forceinline__ void q38_shared_down_chunkN(const uint16_t *d, const float *hs, int base, int lane, int S_, float (&m)[4]) {
+    for (int i = 0; i < 4; i++) m[i] = 0.0f;
+    for (int r = 0; r < 32; ++r) {
+        float sv[N];
+        uint4 dv = make_uint4(0u, 0u, 0u, 0u);
+        if (lane < S_ / 8) dv = __ldg(reinterpret_cast<const uint4 *>(d + size_t(base + r) * S_) + lane);
+#pragma unroll
+        for (int i = 0; i < N; i++) {
+            float x = 0.0f;
+            if (lane < S_ / 8) x = q38_dot8(dv, hs + i * S_ + lane * 8, 0.0f);
+            x = q38_warp_sum(x);
+            sv[i] = __shfl_sync(0xffffffffu, x, 0);
+        }
+#pragma unroll
+        for (int i = 0; i < N; i++) if (lane == r) m[i] = sv[i];
+    }
+}
+__device__ __noinline__ bool q38_mr_shared(const Weights* layers,SharedResidentControl* control,SharedResidentGrid* grid,float* partial,
+    SharedResidentReturn* output,ResidentDirectResult* direct,unsigned worker,unsigned seq,unsigned layer,unsigned &gen,
+    unsigned long long q38_t_seen,float *q38_xs,float *q38_xs2,float *q38_hs,float *reduction){
+#define Q38_MR_SFAIL { if(!blockIdx.x&&!threadIdx.x){unsigned why=atomicAdd(&grid->error,0u);output->status=1;output->exit_reason=why;direct->status=1;direct->exit_reason=why;__threadfence_system();direct->seq=seq;output->seq=seq;pci_cluster_slot_error(pci_cluster_rtx_slot(control),seq,why);} return false; }
+   const unsigned R=control->ple_count;
+   Weights w=layers[layer];int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+   const int gwarp=int(blockIdx.x)*WARPS+warp,nwarps=int(gridDim.x)*WARPS;
+   char *cb=reinterpret_cast<char*>(control);
+   char *sc=reinterpret_cast<char*>(control->batch_scratch);
+   float *hidb=reinterpret_cast<float*>(sc+Q38_SBATCH_SCRATCH_HID), *gateb=reinterpret_cast<float*>(sc+Q38_SBATCH_SCRATCH_DN);
+   auto hid=[&](unsigned r)->float*{return r?hidb+size_t(r-1)*S:partial;};
+   auto xw=[&](unsigned r)->const uint32_t*{return reinterpret_cast<const uint32_t*>(cb+q38_mr_x_off(r));};
+   if(R<=2){
+    {const volatile uint32_t*x0=xw(0);for(int i=threadIdx.x;i<H/2;i+=blockDim.x){const uint32_t v=x0[i];q38_xs[2*i]=__uint_as_float(v<<16);q38_xs[2*i+1]=__uint_as_float(v&0xFFFF0000u);}}
+    if(R>1){const volatile uint32_t*x1=xw(1);for(int i=threadIdx.x;i<H/2;i+=blockDim.x){const uint32_t v=x1[i];q38_xs2[2*i]=__uint_as_float(v<<16);q38_xs2[2*i+1]=__uint_as_float(v&0xFFFF0000u);}}
+    __syncthreads();
+    q38_shared_v2_hidden2(w.g,w.u,q38_xs,R>1?q38_xs2:nullptr,hid(0),hid(1),gwarp,nwarps,lane,H,S);
+   } else {
+    const uint32_t *const xr[4]={xw(0),xw(1),xw(2),R>3?xw(3):xw(2)};
+    float *const hq[4]={hid(0),hid(1),hid(2),R>3?hid(3):hid(2)};
+    q38_shared_v2_hidden4_bfx(w.g,w.u,xr,R,hq,gwarp,nwarps,lane,H,S);
+   }
+   if(worker==0&&blockIdx.x<R){
+    const unsigned r=blockIdx.x;
+    reduction[threadIdx.x]=R<=2?q38_shared_v2_gate_partial(w.gate,r?q38_xs2:q38_xs,threadIdx.x,blockDim.x,H)
+                               :q38_shared_v2_gate_partial_bfx(w.gate,xw(r),threadIdx.x,blockDim.x,H);
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride;stride>>=1){if(threadIdx.x<stride)reduction[threadIdx.x]+=reduction[threadIdx.x+stride];__syncthreads();}
+    if(!threadIdx.x){const float gv=1.0f/(1.0f+expf(-reduction[0]));if(r)gateb[r-1]=gv;else output->gate=gv;}__syncthreads();}
+   __threadfence();if(!shared_resident_barrier(grid,++gen)) Q38_MR_SFAIL
+   auto*cpu_slot=reinterpret_cast<Q38CpuMailboxSlot*>(control->cpu_mailbox_device_ptr);
+   const volatile Q38MrBlock *mb=reinterpret_cast<const volatile Q38MrBlock*>(cb+Q38_MR_BLOCK_OFF);
+   const unsigned long long ret1=mb->ret1_va; const int step=static_cast<int>(mb->slot1_stride);
+   auto rec=[&](unsigned r){return reinterpret_cast<Q38CpuMailboxSlot*>(ret1+(long long)(r-1)*step);};
+   // hidden rows into shared memory: row 0 in q38_hs (S floats), rows >= 1 in q38_xs (x is no longer needed)
+   {volatile float* hp=hid(0);for(int i=threadIdx.x;i<S;i+=blockDim.x)q38_hs[i]=hp[i];}
+   for(unsigned r=1;r<R;r++){volatile float* hp=hid(r);for(int i=threadIdx.x;i<S;i+=blockDim.x)q38_xs[(r-1)*S+i]=hp[i];}
+   __syncthreads();
+   for(int base=gwarp*32;base<H;base+=nwarps*32){
+    const int row=base+lane;
+    if(R<=2){float m0,m1;
+     if(R>1)q38_shared_v2_down_chunk2(w.d,q38_hs,q38_xs,base,lane,S,m0,m1);else{m0=q38_shared_v2_down_chunk(w.d,q38_hs,base,lane,S);m1=0.0f;}
+     direct->result[row]=m0;cpu_slot->result[row]=m0;if(R>1)rec(1)->result[row]=m1;}
+    else{float m0=q38_shared_v2_down_chunk(w.d,q38_hs,base,lane,S);float mr[4];
+     if(R==3)q38_shared_down_chunkN<2>(w.d,q38_xs,base,lane,S,mr);else q38_shared_down_chunkN<3>(w.d,q38_xs,base,lane,S,mr);
+     direct->result[row]=m0;cpu_slot->result[row]=m0;for(unsigned r=1;r<R;r++)rec(r)->result[row]=mr[r-1];}
+   }
+   if(worker==0&&!blockIdx.x&&!threadIdx.x)direct->gate=output->gate;
+   __threadfence_system();if(!shared_resident_barrier(grid,++gen)) Q38_MR_SFAIL
+   if(!blockIdx.x&&!threadIdx.x){
+    pci_cluster_wtiming_write(control,seq,layer,0u,8u,q38_t_seen,0ull,0ull,0ull,R);
+    output->status=0;direct->status=0;
+    for(unsigned r=1;r<R;r++){auto*rr=rec(r);rr->gate=worker==0?*reinterpret_cast<volatile float*>(gateb+r-1):0.0f;rr->worker=0;rr->layer=1;rr->status=0;__threadfence_system();rr->seq=seq;}
+    cpu_slot->worker=0;cpu_slot->layer=1;cpu_slot->gate=output->gate;cpu_slot->status=0;
+    __threadfence_system();cpu_slot->seq=seq;output->seq=seq;direct->seq=seq;}
+#undef Q38_MR_SFAIL
+   return true;
+}
+// LM-head top-k for two BF16 rows (2026-11-04): as q38_lm2_routed, with the kernel's two x buffers.
+__device__ __noinline__ bool q38_lm2_shared(SharedResidentControl* control, SharedResidentGrid* grid, const uint8_t* ple_table,
+    SharedResidentReturn* output, ResidentDirectResult* direct, unsigned seq, unsigned &gen, float *xs0, float *xs1) {
+ // LM-head top-k for N = 2..4 BF16 rows (2026-11-04), as q38_lm2_routed, with the kernel's two x buffers.
+ const unsigned n=control->reserved;
+ if(n==2)pci_cluster_lm_matvec2(control,ple_table,xs0,xs1);
+ else if(n==3)pci_cluster_lm_matvecN<3>(control,ple_table,reinterpret_cast<uint32_t*>(xs0),reinterpret_cast<uint32_t*>(xs1));
+ else pci_cluster_lm_matvecN<4>(control,ple_table,reinterpret_cast<uint32_t*>(xs0),reinterpret_cast<uint32_t*>(xs1));
+ if(!shared_resident_barrier(grid,++gen))return false;
+ const unsigned rows=static_cast<unsigned>(control->ple_offsets[2*control->cpu_mailbox_worker+1]);
+ const unsigned k=min(static_cast<unsigned>(control->ple_count),rows);
+ float lse=0.0f;
+ if(blockIdx.x==0)lse=pci_cluster_lm_select(control,ple_table,direct);
+ if(blockIdx.x>=1&&blockIdx.x<n){const unsigned r=blockIdx.x;
+  const float l=pci_cluster_lm_select(control,ple_table,direct,reinterpret_cast<const unsigned*>(control->batch_scratch)+size_t(r-1)*rows,r*(k+1u));
+  if(!threadIdx.x){reinterpret_cast<volatile float*>(direct->result)[PCI_CLUSTER_LM_LSE1_WORD-(r-1)]=l;Q38CpuMailboxSlot*s=pci_cluster_rtx_slot(control);
+   if(s)reinterpret_cast<volatile float*>(s->result)[PCI_CLUSTER_LM_LSE1_WORD-(r-1)]=l;__threadfence_system();}}
+ if(!shared_resident_barrier(grid,++gen))return false;
+ if(!blockIdx.x&&!threadIdx.x){direct->gate=lse;output->status=0;direct->status=0;__threadfence_system();output->seq=seq;direct->seq=seq;pci_cluster_slot_ack(pci_cluster_rtx_slot(control),seq,lse);}
+ return true;
 }
 // __launch_bounds__(256, 2): the persistent grid needs 2 blocks per SM (10 blocks on 5 SMs, occupancy-checked at load).
 extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_shared(const Weights* layers,SharedResidentControl* control,SharedResidentGrid* grid,float* partial,SharedResidentReturn* output,const uint8_t* ple_table,unsigned worker,unsigned long long deadline){
@@ -25,7 +139,9 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_shared(con
   // installs a BAR1 PTE over it. cudaHostGetDevicePointer alone can leave
   // untouched pages without a queryable UVM leaf.
   auto *cpu_slot=reinterpret_cast<volatile unsigned*>(control->cpu_mailbox_device_ptr);
-  if(cpu_slot){unsigned observed=0;for(unsigned byte=0;byte<Q38_CPU_MAILBOX_SLOT_BYTES;byte+=4096)observed^=cpu_slot[byte/sizeof(unsigned)];asm volatile("" :: "r"(observed) : "memory");}
+  if(cpu_slot){unsigned observed=0;for(unsigned byte=0;byte<Q38_CPU_MAILBOX_SLOT_BYTES;byte+=4096)observed^=cpu_slot[byte/sizeof(unsigned)];
+   for(unsigned byte=0x3000;byte<0xC000;byte+=4096)observed^=cpu_slot[byte/sizeof(unsigned)];   /* mode 10 row-1 pages (2026-11-04), reads only */
+   asm volatile("" :: "r"(observed) : "memory");}
   // Materialize all leaf pages covering the direct result record before an
   // external requester validates and installs return aliases.
   direct->result[1024]=0.0f;
@@ -41,7 +157,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_shared(con
   if(!threadIdx.x){unsigned long long start=clock64();unsigned v=last;while(v==last&&clock64()-start<deadline)v=control->seq;seq=v;if(!blockIdx.x)q38_t_seen=pci_cluster_gtimer();timeout=v==last;layer=control->layer;mode=control->mode;xfmt=control->reserved;
    /* mode 9 (pipelined batch, 2026-11-03): next request = last+1 in host slot (last+1)&1, see the routed kernel */
    prow=0;pok=0;if(mode==Q38_BATCH_PIPE_MODE&&!timeout&&control->batch_area){if(v-last<=Q38_BATCH_PIPE_SLOTS)seq=last+1;const volatile unsigned*hd=q38_batch_req_hdr(q38_batch_area(control),seq&1u);prow=hd[1];layer=hd[2];pok=hd[3]==seq;}}
-  __syncthreads();unsigned reason=0;if(timeout)reason|=1u;if(mode!=1&&mode!=2&&mode!=3&&mode!=4&&mode!=5&&mode!=PCI_CLUSTER_MODE_ROW_GATHER&&mode!=PCI_CLUSTER_MODE_LM_TOPK&&mode!=Q38_BATCH_MODE&&mode!=Q38_BATCH_PIPE_MODE)reason|=2u;if(mode==1&&layer>=48)reason|=4u;if(mode==4&&control->ple_count&&!ple_table)reason|=8u;if(mode==4&&control->ple_count>SHARED_RESIDENT_PLE_MAX_ROWS)reason|=16u;if(mode==PCI_CLUSTER_MODE_ROW_GATHER&&!threadIdx.x)reason|=pci_cluster_row_gather_validate(control,ple_table);if(mode==PCI_CLUSTER_MODE_LM_TOPK&&!threadIdx.x)reason|=pci_cluster_lm_validate(control,ple_table);if(mode==Q38_BATCH_MODE&&(control->ple_count<1||control->ple_count>Q38_BATCH_MAX_ROWS||!control->batch_area||!control->batch_scratch||control->batch_scratch_bytes<Q38_SBATCH_SCRATCH_BYTES||control->cpu_mailbox_worker>=Q38_CPU_MAILBOX_WORKERS||!(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)||layer>=48))reason|=Q38_BATCH_REASON_CONFIG;if(mode==Q38_BATCH_PIPE_MODE&&(!pok||prow<1||prow>Q38_BATCH_PIPE_ROWS||!control->batch_area||!control->batch_scratch||control->batch_scratch_bytes<Q38_SBATCH_SCRATCH_BYTES||control->cpu_mailbox_worker>=Q38_CPU_MAILBOX_WORKERS||!(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)||layer>=48))reason|=Q38_BATCH_REASON_CONFIG;if(seq!=last+1)reason|=32u;if(reason&&!threadIdx.x)atomicOr(&grid->error,reason);
+  __syncthreads();unsigned reason=0;if(timeout)reason|=1u;if(mode!=1&&mode!=2&&mode!=3&&mode!=4&&mode!=5&&mode!=PCI_CLUSTER_MODE_ROW_GATHER&&mode!=PCI_CLUSTER_MODE_LM_TOPK&&mode!=Q38_BATCH_MODE&&mode!=Q38_BATCH_PIPE_MODE&&mode!=Q38_MR_MODE)reason|=2u;if(mode==Q38_MR_MODE&&!threadIdx.x)reason|=q38_mr_validate_shared(control,layer,xfmt);if(mode==1&&layer>=Q38_LAYERS_WITH_MTP)reason|=4u;if(mode==4&&control->ple_count&&!ple_table)reason|=8u;if(mode==4&&control->ple_count>SHARED_RESIDENT_PLE_MAX_ROWS)reason|=16u;if(mode==PCI_CLUSTER_MODE_ROW_GATHER&&!threadIdx.x)reason|=pci_cluster_row_gather_validate(control,ple_table);if(mode==PCI_CLUSTER_MODE_LM_TOPK&&!threadIdx.x)reason|=pci_cluster_lm_validate(control,ple_table);if(mode==Q38_BATCH_MODE&&(control->ple_count<1||control->ple_count>Q38_BATCH_MAX_ROWS||!control->batch_area||!control->batch_scratch||control->batch_scratch_bytes<Q38_SBATCH_SCRATCH_BYTES||control->cpu_mailbox_worker>=Q38_CPU_MAILBOX_WORKERS||!(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)||layer>=Q38_LAYERS_WITH_MTP))reason|=Q38_BATCH_REASON_CONFIG;if(mode==Q38_BATCH_PIPE_MODE&&(!pok||prow<1||prow>Q38_BATCH_PIPE_ROWS||!control->batch_area||!control->batch_scratch||control->batch_scratch_bytes<Q38_SBATCH_SCRATCH_BYTES||control->cpu_mailbox_worker>=Q38_CPU_MAILBOX_WORKERS||!(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)||layer>=Q38_LAYERS_WITH_MTP))reason|=Q38_BATCH_REASON_CONFIG;if(seq!=last+1)reason|=32u;if(reason&&!threadIdx.x)atomicOr(&grid->error,reason);
   if(!shared_resident_barrier(grid,++gen)){if(!blockIdx.x&&!threadIdx.x){unsigned why=atomicAdd(&grid->error,0u);output->status=1;output->exit_reason=why;direct->status=1;direct->exit_reason=why;__threadfence_system();direct->seq=seq;output->seq=seq;pci_cluster_slot_error(pci_cluster_rtx_slot(control),seq,why);}return;}
   if(mode==3) { if(!blockIdx.x&&!threadIdx.x){output->status=0;direct->status=0;__threadfence_system();output->seq=seq;direct->seq=seq;} last=seq; __syncthreads(); continue; }
   if(mode==5) {
@@ -55,6 +171,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_shared(con
    last=seq;continue;
   }
   if(mode==2){if(!blockIdx.x&&!threadIdx.x){output->status=0;output->exit_reason=2;direct->status=0;direct->exit_reason=2;__threadfence_system();output->seq=seq;direct->seq=seq;}return;}
+  if(mode==PCI_CLUSTER_MODE_LM_TOPK&&control->reserved>=PCI_CLUSTER_LM_FMT_BF16X2){
+   if(!q38_lm2_shared(control,grid,ple_table,output,direct,seq,gen,q38_xs,q38_xs2))return;   // two rows (non-inlined)
+   last=seq;continue;
+  }
   if(mode==PCI_CLUSTER_MODE_LM_TOPK){
    // LM-head top-k (pci_cluster_exchange.cuh): slice matvec on all blocks, exact top-K + LSE in block 0.
    pci_cluster_lm_matvec(control,ple_table,q38_xs);
@@ -149,6 +269,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_shared(con
     output->status=0;direct->status=0;__threadfence_system();output->seq=seq;direct->seq=seq;
     pci_cluster_slot_ack(pci_cluster_rtx_slot(control),seq,0.0f);}
 #undef Q38_SBATCH_FAIL
+   last=seq;continue;
+  }
+  if(mode==Q38_MR_MODE){
+   if(!q38_mr_shared(layers,control,grid,partial,output,direct,worker,seq,layer,gen,q38_t_seen,q38_xs,q38_xs2,q38_hs,reduction))return;
    last=seq;continue;
   }
   // ---- Q38 shared v2 (2026-11-02): same grid, buffers and protocol as v1; see resident_shared_v2_math.cuh ----
