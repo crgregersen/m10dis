@@ -2,6 +2,8 @@
 
 Every exchange follows the same pattern: the RTX **broadcasts** one request, every worker runs the operation on its own resident data and writes its part back, and the RTX **waits** for 24 acknowledgements and **combines** the parts. This page explains the mechanisms underneath. The exact request and result formats per mode are in [INTERFACE.md](INTERFACE.md).
 
+![One MoE layer at decode: the RTX publishes one write per card, each PEX8747 multicasts it to 4 GPUs, peers push partial rows to the card leader, leaders write card sums into return slots in RTX VRAM, all 24 workers acknowledge](img/transport-decode.svg)
+
 ## 1. Peer-to-peer through the switch, with ACS relaxed
 
 All GPUs sit below one PEX8748 (see [HARDWARE.md](HARDWARE.md)). PCIe ACS (Access Control Services) on the switch's downstream ports would normally redirect peer requests up to the CPU's root port. The runner clears only the **request and completion redirect bits** (`PCI_ACS_RR | PCI_ACS_CR`) on the seven PEX8748 ports of the M10 cards and the RTX, and on the 20 PEX8747 GPU ports of the five routed cards (for the card sums). It saves every original value and restores it afterwards (`src/run_qwen38_rtx_local_acs_trial.sh`). With redirection off, an RTX write to an M10 address turns around inside the PEX8748.
@@ -18,6 +20,8 @@ A posted write into that window is replicated by the switch to all four GPUs. On
 
 The RTX therefore writes each request **six times**, once per card, and 24 GPUs receive it.
 
+![Multicast inside one M10 card: the multicast window sits in a free gap of the card's bridge window; MC_BASE, MC_RECEIVE and per-port MC_OVERLAY turn one write into four, one per GPU request buffer](img/transport-multicast.svg)
+
 ## 3. Remapped GPU page-table entries (the UVM patches)
 
 CUDA offers no peer access between the RTX and the M10s, so an RTX kernel can't simply store into M10 memory. The patched `nvidia-uvm` (`transport/driver/patches/`) adds a guarded operation that **rewrites a GPU page-table entry** so that a normal device virtual address points at a chosen physical PCIe address:
@@ -27,6 +31,8 @@ CUDA offers no peer access between the RTX and the M10s, so an RTX kernel can't 
 | Request (RTX → M10) | RTX | each card's multicast window | 4 × 4 KiB per card |
 | Return (M10 → RTX) | each worker | that worker's return slot in RTX BAR1 | 3 × 4 KiB per worker |
 | Card sum (M10 → M10) | each peer | the card leader's BAR1 | per peer |
+
+![Remapped page-table entries: RTX request pages point at each card's multicast window, worker return pages at their slot in RTX BAR1, peer pages at the leader's BAR1; every original PTE is kept in a record](img/transport-ptes.svg)
 
 Properties of the mechanism:
 
@@ -67,6 +73,8 @@ This cuts the rows coming back to the RTX from 24 to 6. Reducing on the RTX inst
 ## 7. The host batch area (prefill)
 
 Batched modes would need about 1.3 · R remapped pages per returning worker, so R = 32 rows would already exceed the 512-record table. Modes 8 and 9 therefore move the bulk data through **pinned host memory** instead:
+
+![Batched prefill: the RTX writes rows to pinned host memory and sends only a doorbell through multicast; workers read the rows, leaders write reduced rows and flags back to host memory, the RTX checks the flags and combines](img/transport-prefill.svg)
 
 - The shared CPU mailbox (16,887,808 B of shm) is registered in every worker and in the RTX (`cudaHostRegister`, mapped).
 - After the 24 legacy slots it holds the batch area: request x/ids/routes for up to 64 rows, a gate page, 24 part areas of 64 rows, and a flag page.
