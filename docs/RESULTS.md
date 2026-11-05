@@ -75,7 +75,7 @@ What did not help: unrolling the gate/up lane loop (gate/up 62 → 81 µs for 2 
 |---|---|---|
 | RTX begin + publish + go (one kernel, outer multicast) | 4.1 µs | `pubgo_merge` |
 | Wait for the 24 worker headers (M10 round trip) | 117.8 µs | `pubgo_merge` |
-| RTX combine (9 result rows) | 6.1 µs | `pubgo_merge` |
+| RTX combine (9 result rows: 5 card-leader sums of the routed experts + 4 shared-expert rows, summed on the RTX) | 6.1 µs | `pubgo_merge` |
 | **Whole layer** | **128.0 µs** (+ 5.1 µs to the next layer) | `pubgo_merge` |
 
 Inside the round trip, the slowest worker is a card leader (critical path 91.1 µs, worker clocks, runs `ackprof_D_outer`, `diag_ref_newkern` v2, `prof_on`):
@@ -89,7 +89,7 @@ Inside the round trip, the slowest worker is a card leader (critical path 91.1 �
 | Leader: own sum (2.0) + write + system fence (4.1) | 7.2 µs |
 | Leader: grid barrier + ack | 5.1 µs |
 
-The rest of the 117.8 µs (≈ 27 µs) is the request reaching the workers and the last leader's data and header crossing the RTX's x4 link. That link carries all nine result rows (≈ 90 KB per layer per row), so it is the limit from 2 rows on: without the result writes (diagnostic `diag_nortx` v2) a layer is 2 / 20 / 54 µs faster at 1 / 2 / 4 rows.
+The rest of the 117.8 µs (≈ 27 µs) is the request reaching the workers and the last leader's data and header crossing the RTX's x4 link. That link carries all nine result rows (≈ 90 KB per layer per row; the shared card has no on-card sum in decode, unlike prefill mode 9, so its four workers each send a row), so it is the limit from 2 rows on: without the result writes (diagnostic `diag_nortx` v2) a layer is 2 / 20 / 54 µs faster at 1 / 2 / 4 rows.
 
 The compute is close to the M10's practical bandwidth: in `bench_m10_expert_compute` (runs `m10_compute_bench` v1/v2) the deployed gate/up + down take 56.3 µs, and the best variants (2 rows per warp, transposed down layout, up to 40 warps per SM) 50.3 µs. Gate/up stays at ≈ 30 µs (≈ 60 GB/s of the 83 GB/s peak) at any occupancy. [TRANSPORT.md §9](TRANSPORT.md#9-what-limits-the-decode-exchange) lists the transport experiments.
 
