@@ -94,10 +94,17 @@ def validate_ple_owner_binary(path: Path) -> None:
         )
 
 
+_ATOMIC_JSON_LOCK = threading.Lock()
+
+
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(value, indent=2) + "\n")
-    tmp.replace(path)
+    # 2026-11-04 (T277): several daemon threads write the state file; with a pid-only temp name two concurrent
+    # writers shared one temp file and the second rename failed (FileNotFoundError), which sent the daemon into
+    # ERROR_CLEANUP. Writers are serialized now, and the temp name is unique per thread as well.
+    with _ATOMIC_JSON_LOCK:
+        tmp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(value, indent=2) + "\n")
+        tmp.replace(path)
 
 
 def query_m10_memory() -> list[dict[str, Any]]:
