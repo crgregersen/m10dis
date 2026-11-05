@@ -1,6 +1,6 @@
 # Results
 
-All numbers come from runs on the test machine (2026-11-02 to 2026-11-04). Every run has an entry in [`results/experiment-log.json`](../results/experiment-log.json), with its label, goal, pre-registered expectation where there was one, and result. Labels like `t20d` or `i15` below refer to that log.
+All numbers come from runs on the test machine (2026-11-02 to 2026-11-05). Every run has an entry in [`results/experiment-log.json`](../results/experiment-log.json), with its label, goal, pre-registered expectation where there was one, and result. Labels like `t20d` or `i15` below refer to that log.
 
 ## Throughput
 
@@ -30,16 +30,27 @@ All numbers come from runs on the test machine (2026-11-02 to 2026-11-04). Every
 
 ## MTP speculative decoding
 
-2026-11-04, the frozen serving configuration with `max_model_len` 32,768, 1000 generated tokens per run, MTP layer resident as layer 48, multi-row exchange up to 4 rows (`Q38_RTX_PEER_MOE_MULTIROW_MAX=4`) and the N-row LM head. Rates include the short prefill.
+Current defaults (2026-11-05): `max_model_len` 32,768, 1000 generated tokens per run, MTP layer resident as layer 48, multi-row exchange up to 4 rows (`Q38_RTX_PEER_MOE_MULTIROW_MAX=4`), N-row LM head, outer multicast group, streamed card-sum finish and one-kernel publish+go. Rates include the short prefill (115 tokens natural, 265 humaneval). One run per point, runs `ksweep_N_k*` / `ksweep_H_k*` (pueue tasks 311-318). Acceptance is the share of drafts accepted at each draft position.
 
-| Draft tokens | Natural long-form prompt (`prompts/mtp_eval_prompt.txt`) | Humaneval prompt, `ignore_eos` |
-|---|---|---|
-| 0 | 53.4 tok/s (54.9 with the outer multicast group) | 51.8 tok/s |
-| 1 | **65.6** (70 % accepted, 1.70 tokens per step); **67.8** with the outer group | 69.4 (89 %) |
-| 2 | 65.4 (70 / 66 % per position); 68.0 with the outer group | 82.6 (97 / 97 %) |
-| 3 | 60.1 (67 / 67 / 56 %) | **89.6** (97 / 99 / 96 %); **93.7** with the outer group |
+| Draft tokens | Natural long-form prompt (`prompts/mtp_eval_prompt.txt`) | Accepted per position | Tokens per step | Humaneval prompt, `ignore_eos` | Accepted per position | Tokens per step |
+|---|---|---|---|---|---|---|
+| 0 | 56.3 tok/s | – | 1 | 54.6 tok/s | – | 1 |
+| 1 | **69.8** | 70 % | 1.70 | 74.1 | 89 % | 1.89 |
+| 2 | 69.0 | 70 / 46 % | 2.16 | 88.3 | 97 / 93 % | 2.90 |
+| 3 | 64.3 | 67 / 45 / 26 % | 2.38 | **96.3** | 97 / 96 / 92 % | 3.84 |
 
-With the streamed card-sum finish (default since 2026-11-04; per-block flags, no barrier between down and finish; exchange 141.3 → 133.1 µs per layer for 1 row, 400.4 → 379.9 µs for 4; runs `stream_poc_off` / `stream_poc_on`): **55.7** (0 drafts), **69.5** (1), **69.8** (2) tok/s on the natural prompt and **95.8** (3, humaneval), runs `stream_final_*`.
+Single runs vary by up to about 1.4 %, so 1 and 2 drafts are level on natural text. Suggested: 2 draft tokens by default (1 % behind 1 draft on natural text, 19 % ahead on code), 3 for code-heavy work.
+
+### How MTP decode got there
+
+Each row includes the changes above it.
+
+| Change | Natural, 0 / 1 / 2 / 3 drafts (tok/s) | Humaneval, 3 drafts | Runs |
+|---|---|---|---|
+| N-row exchange, faster multi-row down, N-row LM head (2026-11-04) | 53.4 / 65.6 / 65.4 / 60.1 | 89.6 | `final_*`, `fastdown_*` |
+| + outer multicast group | 54.9 / 67.8 / 68.0 / – | 93.7 | `outer_final_*` |
+| + streamed card-sum finish (exchange 141.3 → 133.1 µs per layer for 1 row, 400.4 → 379.9 µs for 4; runs `stream_poc_off` / `stream_poc_on`) | 55.7 / 69.5 / 69.8 / – | 95.8 | `stream_final_*` |
+| + one-kernel publish+go (2026-11-05) | 56.3 / 69.8 / 69.0 / 64.3 | 96.3 | `ksweep_*` |
 
 With begin, publish and go in one RTX kernel (default since 2026-11-05, `Q38_RTX_PEER_PUBLISH_ORDER=4`; exchange 133.1 → 128.0 µs per layer for 1 row, 204.8 → 200.7 for 2, 380.9 → 374.8 for 4, runs `pubgo_ref` / `pubgo_merge`), mean of four alternating pairs on the natural prompt (runs `pubgo_tps_*`; identical tokens in all runs):
 
@@ -52,7 +63,7 @@ The harness saving (4–6 µs per layer) shrinks inside vLLM's CUDA graph, where
 
 The outer group (`Q38_RTX_PEER_PEX_OUTER=1`, [TRANSPORT.md](TRANSPORT.md#8-optional-one-outer-multicast-group-q38_rtx_peer_pex_outer1)) publishes each request once instead of six times: 16.4 → 7.2 µs per MoE layer for one row, 45.1 → 11.3 µs for four, with identical results.
 
-The humaneval column overstates acceptance: with `ignore_eos` the model keeps going after its answer, and that continuation repeats. The best draft length is lower than on a single GPU, because every verify row costs M10 time: one multi-row exchange takes 150 / 239 / 337 / 432 µs per layer for 1 / 2 / 3 / 4 rows (bandwidth-bound: each row reads its own experts). Suggested: 2 draft tokens by default, 3 for code-heavy work. The MTP layer's attention KV costs about 21 % of the KV pool (66,628 instead of 84,440 tokens at 2.5 GiB).
+The humaneval column overstates acceptance: with `ignore_eos` the model keeps going after its answer, and that continuation repeats. The best draft length is lower than on a single GPU, because every verify row costs M10 time: one multi-row exchange takes 150 / 239 / 337 / 432 µs per layer for 1 / 2 / 3 / 4 rows (bandwidth-bound: each row reads its own experts). Speculative decoding takes KV-pool space; see [Memory and context](#memory-and-context).
 
 What did not help: unrolling the gate/up lane loop (gate/up 62 → 81 µs for 2 rows) and reading experts shared by consecutive tokens once (3.7 of 10 are shared on average; less load overlap made it slower). Both reverted. Records `mtp_*`, `mr_*`, `lm2_*`, `nrow_*`, `fastdown_*`, `final_*` in the run log.
 
@@ -111,6 +122,7 @@ Fit over the batched compute (µs per call, R rows, distinct experts D): gate/up
 | RTX model weights in vLLM | 3.62 GiB with FP8 hyper-connections (4.22 GiB with BF16) |
 | Hyper-connection matrices | 194 matrices, 1.213 GiB BF16 → 0.645 GiB FP8 |
 | KV cache | 2.5 GiB → **94,631 tokens**; `max_model_len` 90,112 |
+| Context in the MTP runs | `max_model_len` 32,768; the model supports 262,144 (`max_position_embeddings`) |
 
 KV capacity per configuration, measured by the vLLM start (runs `s1`–`s3`):
 
@@ -120,6 +132,15 @@ KV capacity per configuration, measured by the vLLM start (runs `s1`–`s3`):
 | 1 GiB | off | 34,028 |
 | 2 GiB | off | 75,296 |
 | 2.5 GiB | off | 94,631 (needs `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`: the default 512 MiB indexer workspace ran out of memory in the first prefill) |
+
+KV capacity at 2.5 GiB in the MTP runs (`max_model_len` 32,768), from the vLLM start of runs `ksweep_*` (decode-profile run directories 20261105T002529Z-20261105T003758Z). The MTP layer's attention KV and the draft slots take part of the pool; one request can still use the full 32,768 tokens in every row.
+
+| Draft tokens | Tokens |
+|---|---|
+| 0 (no speculative config) | 84,440 |
+| 1 | 66,628 |
+| 2 | 58,789 |
+| 3 | 52,601 |
 
 With prefix caching on, vLLM's Mamba "align" mode stores a GDN state snapshot for every 1,568-token block. That costs 72.8 KB per token instead of 31.6 KB.
 

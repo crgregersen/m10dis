@@ -815,6 +815,1173 @@
    "status": "success",
    "pueue_task": 188,
    "result": "LCB_TOTAL pass 35/40 (87.5%), capped 2, easy 10/10, medium 12/12, hard 13/18"
+  },
+  {
+   "label": "m10dis_daemon_restart_from_new_tree_20261104_v1",
+   "what": "ordered daemon restart with the m10dis release tree: STOP old daemon (qwen38-full-daemon/20261103T185050Z), start from m10dis sources with M10DIS_RUNS=$M10DIS_RUNS",
+   "goal": "the release tree builds and starts the daemon (48 layers READY, PARKED)",
+   "runner": "src/run_qwen38_daemon_restart.sh",
+   "status": "success",
+   "pueue_task": 192,
+   "result": "FULL_DAEMON_RUN_OK from m10dis tree: services, cubins, PLE owner built from m10dis/src; READY 48 layers in 181.5 s (PLE 51.2 GB 38.5 s, experts 128.8 GB 140.1 s), PARKED. Folder m10dis-runs/qwen38-full-daemon/20261104T114749Z."
+  },
+  {
+   "label": "m10dis_floor_i15_repeat_20261104_v1",
+   "what": "i15 repeated from the m10dis tree: 5 pipelined runs, FP8 HC, chunk 1024, autotune off, logprobs 5, same 4k prompt (cmp identical)",
+   "goal": "release tree within the LM-head jitter floor of i15 (lm_head_floor.py cross check)",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "failed",
+   "pueue_task": 193,
+   "result": "exit 1 in the first run (23 s): client preflight FAILED_RESIDENT_PREFLIGHT, build/libqwen38_direct_moe.so missing in the release tree (old repo had it prebuilt; trace missed build_qwen38_direct_moe.sh). Cleanup checks OK (ACS restored, MC unchanged, daemon READY PARKED, worker seq aligned, no routes applied). Fix: daemon start builds the library per run into RUN/build; pex client no longer overrides the path."
+  },
+  {
+   "label": "m10dis_daemon_restart_from_new_tree_20261104_v2",
+   "what": "daemon restart from m10dis after the direct-MoE library build fix (daemon start builds it into RUN/build)",
+   "goal": "daemon READY 48 PARKED with the library present",
+   "runner": "src/run_qwen38_daemon_restart.sh",
+   "status": "success",
+   "pueue_task": 194,
+   "result": "FULL_DAEMON_RUN_OK from m10dis with libqwen38_direct_moe.so built into RUN/build; READY 48 PARKED, kernel reload generation 1. Folder m10dis-runs/qwen38-full-daemon/20261104T115439Z."
+  },
+  {
+   "label": "m10dis_floor_i15_repeat_20261104_v2",
+   "what": "i15 repeat from m10dis (as v1)",
+   "goal": "cross floor vs i15 within the i13/i15 floors",
+   "runner": "src/run_qwen38_moe_batch_integration.sh",
+   "status": "success",
+   "pueue_task": 195,
+   "result": "5/5 PASS_VLLM_RESIDENT_M10_CLIENT, all eb7d0aab4915 (= i15), 8 runner checks OK each; prefill 272.8-276.0 tok/s. Floor: m10dis set max 1.186 / median 0.311; i15 1.250 / 0.296; cross m10dis x i15 max 1.500 / median 0.312: above each 5-run floor, inside the 10-run i13 floor 2.13 and below the accepted i15 x i13 cross 1.875 -> similar. Folder m10dis-runs/batched-moe-research/integration-20261104T115829Z."
+  },
+  {
+   "label": "decode_profile_breakdown_20261104_v1",
+   "what": "decode profile, frozen benchmark config, generation mode, 4k prompt, 1500 new tokens; graph ceiling + per-exchange breakdown (50 steps) + py-spy 5 s",
+   "goal": "where the 19 ms decode step goes now (after FP8 HC/QSA): RTX compute vs MoE vs LM head vs host overhead",
+   "pre_reg": "graph_lm_argmax ~19 ms; real step - graph ceiling < 0.5 ms (host overhead small, as on 11-03: 20.5 vs ~20.7); rtx_before 10.5-11.5 ms; MoE round trips 6.3-6.9 ms; LM-head round trip ~0.9 ms; runner checks pass",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 196,
+   "result": "PASS, runner checks OK; decode 53.4 tok/s (18.7 ms). Replayed step 18.49 ms: RTX compute 10.07 ms (GDN ~200 us/layer, attention ~220, layer 1 345), MoE round trips 5.97 ms (~125 us x 48), LM-head round trip 0.90, publish 0.96 (MoE 18.4 us/layer), combine 0.50, PLE 0.05; host overhead ~0.3 ms (graph_lm_argmax 18.41 vs real 18.7). py-spy: engine mostly in Event.synchronize (host waits on GPU). Expectation met except RTX compute 10.1 < 10.5. Folder m10dis-runs/decode-profile/20261104T152700Z"
+  },
+  {
+   "label": "decode_profile_nsys_20261104_v1",
+   "what": "same run under nsys launch (cuda,nvtx; CUDA graphs per node); 3 s collection in steady decode",
+   "goal": "kernel-level split of the RTX compute inside a decode step",
+   "pre_reg": "report written; decode rate within 10 % of run A; runner checks pass. If nsys breaks the peer path: run fails, no retry",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed (capture)",
+   "pueue_task": 197,
+   "after": 196,
+   "result": "Run PASS (54.0 tok/s, breakdown identical to A) but no CUDA data: `nsys start` RPC timed out (SessionImpl: rpc Start ... timeout period is expired, start_rc 1); the .qdstrm converts to a report with process/thread tables only, no kernel table. Not retried. Folder m10dis-runs/decode-profile/20261104T152908Z"
+  },
+  {
+   "label": "decode_profile_nsys_20261104_v2",
+   "what": "as nsys v1 but `nsys profile --delay=95 --duration=4 --kill=none` (root cause of v1: nsys launch/start RPC timeout); 3000 new tokens so the window is inside steady decode (v1: decode from ~81 s after client start)",
+   "goal": "kernel-level split of the RTX compute (10.1 ms per step)",
+   "pre_reg": "report with a CUDA kernel table; client not killed by nsys; runner checks pass; decode within 10 % of 53.4 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed (capture window)",
+   "pueue_task": 198,
+   "retry_of": "decode_profile_nsys_20261104_v1",
+   "result": "Run PASS (54.0 tok/s steady, 3000 tokens, breakdown = run A; --kill=none worked, client not killed). CUDA tracing worked (CUDA_GRAPH_EVENTS from EngineCore pid 821501) but the window missed decode: nsys counts --delay from the profiled process's CUDA init (EngineCore, 16:36:33 = 49 s after client start), not from launch, so collection ran 16:38:08-12, after decode ended (16:38:04). Steady decode was at origin +35..+91 s. Not retried."
+  },
+  {
+   "label": "decode_profile_nsys_20261104_v3",
+   "what": "as nsys v2 with --delay=55 (root cause of v2: nsys counts the delay from the EngineCore's CUDA init; steady decode was at +35..+91 s)",
+   "goal": "kernel-level split of the RTX compute (10.1 ms per step)",
+   "pre_reg": "CUDA kernel table covering ~4 s of steady decode (~215 steps); client not killed; runner checks pass",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed (lock)",
+   "pueue_task": 199,
+   "retry_of": "decode_profile_nsys_20261104_v2",
+   "result": "Did not start: ACS trial lock /run/lock/qwen38-rtx-local-acs.lock held by v2 leftovers. With --kill=none the nsys CLI exits after the window and the client main python (pid 821281, + resource tracker 821500, nsys agent 821195, launcher 821280, tee 821282) stays behind holding the inherited lock fd 9; no GPU contexts, EngineCore gone, v2 routes 141/141 restored, ACS restored. v3 touched nothing (0 routes, MC registers unchanged, daemon READY/PARKED/48). Hazard found: with a mid-decode window the wrapper would continue to ACS restore/DMA-helper unload while vLLM still decodes with routes applied -> delay/duration + kill=none must not be used. Not retried."
+  },
+  {
+   "label": "decode_profile_nsys_20261104_v4",
+   "what": "nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop (no duration/kill); adapter opens the range at decode token 500 for 200 tokens; wrapper waits for the real client before cleanup. v2 leftovers (5 pids) killed by exact pid first, lock free",
+   "goal": "kernel-level split of the RTX compute (10.1 ms per step)",
+   "pre_reg": "CUDA kernel table for ~200 decode steps; Q38_CUDA_PROFILER start/stop lines; client exits normally (NSYS_CLIENT_WAIT seconds ~0); no leftover processes; runner checks pass",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 200,
+   "retry_of": "decode_profile_nsys_20261104_v3",
+   "result": "PASS, 8 runner checks OK, 141/141 routes restored, client exited normally (NSYS_CLIENT_WAIT 0 s), no leftovers. Profiler range 500->700 tokens but CUPTI kept only ~3 decode steps (3 graph launches, 4301 kernels, 55 ms; GPU busy 54.7 of 55.2 ms). Per step: M10 exchange kernels 8.26 ms (wait_combine 7.13, publish/seq/begin 1.13); RTX 10.0 ms = Marlin FP8 GEMM 5.39 (96 calls x 56 us, ~2.67 GB -> ~496 GB/s = 82 % of 608), HC FP8 GEMV 1.65 (194 x 8.5 us, ~63 %), cuBLAS BF16 GEMV 0.54 (router, GDN a/b, indexer), GDN recurrence 0.41, ~1000 small kernels ~2.0 (reduce 0.29, router topk 0.27, HC small 0.45, QSA ~0.5, copies 0.21, conv/norm 0.13), one BF16 GEMM 0.13 (unidentified). Folder m10dis-runs/decode-profile/20261104T155648Z; report converted in the session scratchpad."
+  },
+  {
+   "label": "mr_kernel_reload_20261104_v1",
+   "what": "hot-swap worker cubins with mode 10 (multi-row decode MoE) + timing ring at 0x3C000",
+   "goal": "new kernels live without daemon restart",
+   "pre_reg": "RELOAD_KERNELS OK, daemon READY/PARKED/48; routed 128 regs, 4/8 B spill; shared 0 spill",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "queued",
+   "pueue_task": 201
+  },
+  {
+   "label": "mr_test_20261104_v1",
+   "what": "decode profile run (frozen bench config, 300 tokens) with Q38_RTX_PEER_MOE_MULTIROW=1, then batch timing R=2 per_row/multi/batch (5 passes) + stress multi 10 passes x 48 layers",
+   "goal": "mode 10 correct (bit-identical to mode 1), faster than 2 x mode 1, mode 1 not regressed by the new cubins",
+   "pre_reg": "RTX_PEER_MR_READY 15 row-1 routes, 54 routes; 189 applies/189 restores + 24 request; stress multi 0 bad rows; multi <= 0.22 ms per 2-row call vs ~0.30 per_row (>= 1.35x); decode 53.4 +- 3 %, ceiling 18.4 +- 0.4 ms; runner checks pass",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "queued",
+   "pueue_task": 202,
+   "after": 201
+  },
+  {
+   "label": "mtp_daemon_restart_49_20261104_v1",
+   "what": "daemon restart with Q38_DAEMON_LAYERS=49: layer 48 = MTP experts/shared expert (bundle layer_48 packed task 205); services + cubins built from source (mode 10 fused 2-row loops)",
+   "goal": "M10s hold the MTP layer",
+   "pre_reg": "READY with 49 layers, loaded_layer_ids 0..48, ~190 s; routed GPUs ~120 MiB more each",
+   "runner": "src/run_qwen38_daemon_restart.sh",
+   "status": "success",
+   "pueue_task": 206,
+   "result": "READY 49 layers in 188.1 s (experts 147.5 s); routed GPU 0 7217 MiB, others 7598 MiB (+127 MiB)"
+  },
+  {
+   "label": "mtp_baseline_20261104_v1",
+   "what": "baseline decode, no MTP: frozen bench config, humaneval32 prompt, 1000 tokens, max_model_len 32768, multi-row on",
+   "goal": "reference t/s for the MTP run on the same prompt/settings",
+   "pre_reg": "PASS, ~51-53 tok/s (tokens/elapsed incl. short prefill)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pueue_task": 207,
+   "after": 206,
+   "result": "rc 90: inner client wrapper asserted layers_ready == 48 (49 now) after the ACS trial had relaxed ACS on 27 ports; the trial preserved ACS (cleanup not proven). No client, no routes, no DMA helper. ACS restored manually from acs-controls.tsv, 27/27 match (acs-route-20261104T164920Z/manual-restore-20261104.log). Fixed the assert (48 or 49)."
+  },
+  {
+   "label": "mtp_spec1_20261104_v1",
+   "what": "same with Q38_MTP_SPEC_TOKENS=1 (vLLM method mtp, 1 draft token; drafter MoE = M10 layer 48, verify 2 rows = mode 10)",
+   "goal": "MTP works end to end; t/s vs baseline",
+   "pre_reg": "PASS; mean accepted tokens per step > 1.5; t/s > baseline (estimate 60-72)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "not run (dependency failed)",
+   "pueue_task": 208,
+   "after": 207
+  },
+  {
+   "label": "mtp_baseline_20261104_v2",
+   "what": "as v1 (layers assert fixed)",
+   "retry_of": "mtp_baseline_20261104_v1",
+   "pre_reg": "PASS ~51-53 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pueue_task": 209,
+   "result": "clean FAILED_RESIDENT_PREFLIGHT: client checked layers_ready != 48; ACS restored by the trial (acs_restored_all OK), no routes. Fixed (48 or 49)."
+  },
+  {
+   "label": "mtp_spec1_20261104_v2",
+   "what": "as v1",
+   "retry_of": "mtp_spec1_20261104_v1",
+   "pre_reg": "PASS; >1.5 tokens/step; t/s > baseline",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "not run (dependency failed)",
+   "pueue_task": 210,
+   "after": 209
+  },
+  {
+   "label": "mtp_baseline_20261104_v3",
+   "what": "as v1",
+   "retry_of": "mtp_baseline_20261104_v2",
+   "pre_reg": "PASS ~51-53 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 211,
+   "result": "PASS, 1000 tokens (length) in 19.385 s = 51.6 tok/s incl. 265-token prefill; steady 53.8"
+  },
+  {
+   "label": "mtp_spec1_20261104_v3",
+   "what": "as v1",
+   "retry_of": "mtp_spec1_20261104_v2",
+   "pre_reg": "PASS; >1.5 tokens/step; t/s > baseline",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success (functional)",
+   "pueue_task": 212,
+   "after": 211,
+   "result": "PASS, MTP active; 298 tokens (EOS) in 5.802 s = 51.4 tok/s incl. prefill; coherent code, identical to baseline for 54 tokens then a different valid solution (near-tie, 2-row RTX numerics). No acceptance stats (log stats off); unequal lengths -> v4 with ignore_eos + spec metrics"
+  },
+  {
+   "label": "mtp_baseline_20261104_v4",
+   "what": "baseline, ignore_eos, 1000 tokens",
+   "pre_reg": "~51.6 tok/s incl prefill",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 213,
+   "result": "PASS, 1000 tokens (ignore_eos) in 19.309 s = 51.8 tok/s incl. 265-token prefill"
+  },
+  {
+   "label": "mtp_spec1_20261104_v4",
+   "what": "MTP 1 draft token, ignore_eos, 1000 tokens, vLLM spec-decode counters",
+   "pre_reg": "acceptance > 0.5; t/s > baseline",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 214,
+   "after": 213,
+   "result": "PASS, 1000 tokens in 15.376 s = 65.0 tok/s (+25.6 %). vLLM: 530 drafts, 470 accepted = 88.7 % acceptance, 1.89 tokens/step; 29.0 ms per step vs 19.3 ms per token baseline (verify 2 rows + drafter + 3 LM-head exchanges). Runner checks pass."
+  },
+  {
+   "label": "mr_retime_fused_20261104_v1",
+   "what": "batch timing R=2,3,4 per_row/multi/batch (multi only R=2) + stress multi 5 passes, with the fused 2-row worker loops (49-layer daemon)",
+   "goal": "how much of the +6.9 ms per MTP step the fused loops removed",
+   "pre_reg": "multi R=2 <= 0.24 ms per layer call (was 0.299); bit-identical; stress 0 bad",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 215,
+   "result": "multi R=2 exchange 259.1 us (publish 26.6, wait 198.7, combine 28.7) vs per-row 155.1 us x2; worker critical 173.6 (gate/up 62.5 bandwidth-bound, down 45.1, leader finish 52.2); bit-identical, stress 0 bad. R=3/4 via batch: 460/583 us vs per-row 154.6 x R"
+  },
+  {
+   "label": "mtp_spec2_20261104_v1",
+   "what": "MTP 2 draft tokens (MTP layer reused), ignore_eos 1000 tokens; verify 3 rows via mode 8",
+   "goal": "acceptance per position for the draft-length sweep",
+   "pre_reg": "pos0 ~0.89, pos1 0.6-0.8; t/s may be below k=1 (3-row verify on the host path)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 216,
+   "after": 215,
+   "result": "1000 tokens in 14.754 s = 67.8 tok/s; 345 drafts, accepted per pos [333,322] (96.5 / 96.7 %), 2.90 tokens/step, 42.8 ms/step (3-row verify on mode 8)"
+  },
+  {
+   "label": "mtp_spec3_20261104_v1",
+   "what": "MTP 3 draft tokens, as k=2; verify 4 rows via mode 8",
+   "goal": "acceptance per position",
+   "pre_reg": "pos2 0.4-0.7",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 217,
+   "after": 216,
+   "result": "1000 tokens in 13.384 s = 74.7 tok/s; 261 drafts, per pos [252,250,239], 3.83 tokens/step, 51.3 ms/step (4-row verify on mode 8). Caveat: ignore_eos continuation after the answer is repetitive -> acceptance likely inflated"
+  },
+  {
+   "label": "lm2_kernel_reload_20261104_v1",
+   "what": "hot-swap cubins with the 2-row LM head (mode 7, reserved=2)",
+   "pre_reg": "KERNELS_RELOADED, 49 layers, PARKED",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 218,
+   "result": "KERNELS_RELOADED, PARKED (status prints layers 48 from the reload script text; daemon still 49)"
+  },
+  {
+   "label": "lm2_check_spec1_20261104_v1",
+   "what": "MTP k=1 humaneval ignore_eos 1000 tokens with Q38_M10_LM_HEAD_ROWS2=1, then Q38_LM2_CHECK=20 (2-row vs 2x1-row LM head)",
+   "goal": "2-row LM head identical and faster; MTP k=1 t/s gain",
+   "pre_reg": "bad_logits 0, bad_lse 0; one 2-row call <= 1.2 ms vs ~1.8 ms for two; t/s >= 67 (was 65.0)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 219,
+   "after": 218,
+   "result": "k=1 humaneval ignore_eos: 1000 tokens 14.942 s = 66.9 tok/s (65.0 without 2-row LM head); 470/530 accepted. LM2 check 20 pairs: 2-row call 1.173 ms vs 2.012 ms for two; bad_lse 0, bad_logits 33/40 rows: log-sum-exps identical, so logits identical; differing rows most likely the race-dependent choice among ties at the K-th candidate (atomic tie take in pci_cluster_lm_select) - to confirm with a 1-row vs 1-row repeat"
+  },
+  {
+   "label": "mtp_sweep_natural_k0_20261104_v1",
+   "what": "natural long-form prompt (prompts/mtp_eval_prompt.txt), no ignore_eos, 1000 tokens, MTP k=0, 2-row LM head on",
+   "goal": "draft-length sweep on non-repetitive text",
+   "pre_reg": "acceptance lower than humaneval/ignore_eos; best k in 1..3",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 220,
+   "result": "1000 tokens 18.852 s = 53.0 tok/s"
+  },
+  {
+   "label": "mtp_sweep_natural_k1_20261104_v1",
+   "what": "natural long-form prompt (prompts/mtp_eval_prompt.txt), no ignore_eos, 1000 tokens, MTP k=1, 2-row LM head on",
+   "goal": "draft-length sweep on non-repetitive text",
+   "pre_reg": "acceptance lower than humaneval/ignore_eos; best k in 1..3",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 221,
+   "result": "15.873 s = 63.0 tok/s (+18.8 %); 413/587 = 70.4 %; 1.70 tokens/step; 27.0 ms/step"
+  },
+  {
+   "label": "mtp_sweep_natural_k2_20261104_v1",
+   "what": "natural long-form prompt (prompts/mtp_eval_prompt.txt), no ignore_eos, 1000 tokens, MTP k=2, 2-row LM head on",
+   "goal": "draft-length sweep on non-repetitive text",
+   "pre_reg": "acceptance lower than humaneval/ignore_eos; best k in 1..3",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 222,
+   "result": "18.736 s = 53.4 tok/s; per pos [323,213]/463 (69.8 %, 65.9 % cond.); 2.16 tokens/step; 40.5 ms/step (3-row verify on mode 8)"
+  },
+  {
+   "label": "mtp_sweep_natural_k3_20261104_v1",
+   "what": "natural long-form prompt (prompts/mtp_eval_prompt.txt), no ignore_eos, 1000 tokens, MTP k=3, 2-row LM head on",
+   "goal": "draft-length sweep on non-repetitive text",
+   "pre_reg": "acceptance lower than humaneval/ignore_eos; best k in 1..3",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 223,
+   "result": "20.539 s = 48.7 tok/s; per pos [282,190,107]/420 (67.1, 67.4, 56.3 % cond.); 2.38 tokens/step; 48.9 ms/step"
+  },
+  {
+   "label": "mtp_opt_combine1024_20261104_v1",
+   "what": "MoE wait/combine with 1024 threads (mode 1 and mode 10); MTP k=1 natural prompt 1000 tokens, then batch timing R=1,2 per_row/multi + stress multi",
+   "goal": "combine cost down, results unchanged",
+   "pre_reg": "combine mode 10 <= 12 us (was 28.7), mode 1 <= 5 (9.2); stress 0 bad; t/s >= 64 (63.0)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 224,
+   "result": "combine mode 1 9.2->5.1 us, mode 10 28.7->18.4; multi 247.3 us/layer; stress 0 bad; MTP k=1 natural 15.544 s = 64.3 tok/s (63.0)"
+  },
+  {
+   "label": "mtp_opt_nsys_20261104_v1",
+   "what": "same MTP run under nsys (cudaProfilerApi range, steps 300-400)",
+   "goal": "kernel-level breakdown of one MTP step",
+   "pre_reg": "kernel table for ~100 steps; runner checks pass",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 225,
+   "after": 224,
+   "result": "120 steps: per step wait_combine 12.5 ms (52 exchanges; 48 two-row MoE ~11.5), Marlin 5.39 (same as 1 row), HC FP8 GEMM 1.84, publish 1.27, GDN 2-token 0.65, drafter BF16 attention projections ~0.4"
+  },
+  {
+   "label": "gu_unroll_reload_20261104_v1",
+   "what": "cubins with fully unrolled gate/up lane loops (mode 1 and mode 10; same op order)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 226,
+   "after": 225,
+   "result": "reloaded"
+  },
+  {
+   "label": "gu_unroll_k0_20261104_v1",
+   "what": "natural prompt baseline (no MTP) with unrolled gate/up + 1024-thread combine",
+   "pre_reg": ">= 53.0 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 227,
+   "after": 226,
+   "result": "18.795 s = 53.2 tok/s (no change)"
+  },
+  {
+   "label": "gu_unroll_k1_20261104_v1",
+   "what": "natural prompt MTP k=1 + harness R=1,2 per_row/multi + stress multi",
+   "pre_reg": "gate/up 1 row < 33.8 us, 2 rows < 62.5; stress 0 bad; t/s > 63.0",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success (regression)",
+   "pueue_task": 228,
+   "after": 227,
+   "result": "unroll made it slower: gate/up 1 row 33.8->35.8, 2 rows 62.5->80.9 us; multi 269.3 us/layer; MTP 16.261 s = 61.5 tok/s (64.3). Reverted (math header back to HEAD, dedup kernel without unroll)"
+  },
+  {
+   "label": "dedup_reload_20261104_v1",
+   "what": "cubins: mode 10 expert dedup (union of both rows' experts read once; consecutive tokens share 3.7/10 experts on average), unroll reverted",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 229,
+   "result": "reloaded"
+  },
+  {
+   "label": "dedup_k1_20261104_v1",
+   "what": "MTP k=1 natural prompt + harness R=1,2 per_row/multi + stress multi 10 passes",
+   "pre_reg": "stress 0 bad; 2-row gate/up < 62.5 and down < 45 us (random ids share fewer experts than real ones); t/s > 64.3",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success (regression)",
+   "pueue_task": 230,
+   "after": 229,
+   "result": "stress 0 bad (bit-identical); random ids (no overlap): gate/up 70.7, down 51.2 us (62.5 / 45 before); MTP k=1 natural 15.825 s = 63.2 tok/s (64.3 without dedup). Reverted to the fused version (single paired chains per task give more ILP)"
+  },
+  {
+   "label": "final_reload_20261104_v1",
+   "what": "cubins back to fused 2-row loops + 2-row LM head (no unroll, no dedup)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 231,
+   "result": "reloaded"
+  },
+  {
+   "label": "final_k0_20261104_v1",
+   "what": "final baseline natural prompt",
+   "pre_reg": "~53 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 232,
+   "after": 231,
+   "result": "18.726 s = 53.4 tok/s, checks 8/8"
+  },
+  {
+   "label": "final_k1_20261104_v1",
+   "what": "final MTP k=1 natural prompt (combine 1024, fused 2-row, 2-row LM head)",
+   "pre_reg": "~64 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 233,
+   "after": 232,
+   "result": "15.694 s = 63.7 tok/s (+19.3 % vs 53.4); 413/587 accepted; checks 8/8"
+  },
+  {
+   "label": "nrow_reload_20261104_v1",
+   "what": "cubins with N-row mode 10 (R<=4: packed peer push blocks at 0x0F000/0x17000/0x33000, records +/-3 pages) and N-row LM head (reserved = N)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 234,
+   "result": "reloaded"
+  },
+  {
+   "label": "nrow_check_20261104_v1",
+   "what": "MULTIROW_MAX=4: MTP k=1 natural; harness R=1..4 per_row/multi/batch + stress multi 10 passes; LM check rows 2,3,4",
+   "goal": "N-row exchange correct and fast; mode 1 not regressed by the new main-kernel spills (52/72 B static)",
+   "pre_reg": "MR_READY max_rows 4, 54 routes, ~378 PTE applies; stress 0 bad for R=2..4; multi R=3 < 0.36 ms, R=4 < 0.46 ms per layer (batch 0.46/0.58); per_row R=1 critical ~101 us (no regression); LM check bad_lse 0, bad_logits 0, argmax_bad 0",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 235,
+   "after": 234,
+   "result": "MR_READY max_rows 4, 54 routes, 318/318 route pages + 42/42 request pages restored, 8/8 checks; stress 0 bad R=1..4; per layer per_row 150 us (no mode-1 regression: crit 99-100, gu 32.8, dn 23.6), multi R=2 248.8, R=3 376.8 (batch 456.7), R=4 503.3 (batch 577.5); multi down R=3/4 91/143 us (batch 81/103); LM check rows 3/4 bad_logits 0, rows 2 tie-boundary 16, bad_lse 0, argmax 0; 4-row LM 1.51 ms vs 3.98; MTP k1 natural 15.711 s = 63.6"
+  },
+  {
+   "label": "nrow_sweep_N_k2_20261104_v1",
+   "what": "draft sweep with N-row exchange + N-row LM head (natural prompt, k=2)",
+   "pre_reg": "k>=2 faster than with the mode-8 verify (natural k2 53.4, k3 48.7; humaneval k2 67.8, k3 74.7)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 236,
+   "result": "16.296 s = 61.4 tok/s (53.4 before)"
+  },
+  {
+   "label": "nrow_sweep_N_k3_20261104_v1",
+   "what": "draft sweep with N-row exchange + N-row LM head (natural prompt, k=3)",
+   "pre_reg": "k>=2 faster than with the mode-8 verify (natural k2 53.4, k3 48.7; humaneval k2 67.8, k3 74.7)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 237,
+   "result": "18.198 s = 55.0 (48.7 before)"
+  },
+  {
+   "label": "nrow_sweep_H_k1_20261104_v1",
+   "what": "draft sweep with N-row exchange + N-row LM head (humaneval ignore_eos, k=1)",
+   "pre_reg": "k>=2 faster than with the mode-8 verify (natural k2 53.4, k3 48.7; humaneval k2 67.8, k3 74.7)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 238,
+   "result": "14.714 s = 68.0"
+  },
+  {
+   "label": "nrow_sweep_H_k2_20261104_v1",
+   "what": "draft sweep with N-row exchange + N-row LM head (humaneval ignore_eos, k=2)",
+   "pre_reg": "k>=2 faster than with the mode-8 verify (natural k2 53.4, k3 48.7; humaneval k2 67.8, k3 74.7)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 239,
+   "result": "12.836 s = 77.9 (67.8 before)"
+  },
+  {
+   "label": "nrow_sweep_H_k3_20261104_v1",
+   "what": "draft sweep with N-row exchange + N-row LM head (humaneval ignore_eos, k=3)",
+   "pre_reg": "k>=2 faster than with the mode-8 verify (natural k2 53.4, k3 48.7; humaneval k2 67.8, k3 74.7)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 240,
+   "result": "12.048 s = 83.0 (74.7 before)"
+  },
+  {
+   "label": "fastdown_reload_20261104_v1",
+   "what": "multi-row down loops (2-4 rows) with q38_fp8_fast decode (bit-identical to fp8e4m3)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 241,
+   "result": "reloaded"
+  },
+  {
+   "label": "fastdown_check_k1_20261104_v1",
+   "what": "MTP k1 natural + harness R=2..4 + stress",
+   "pre_reg": "stress 0 bad; multi down R=2 < 46, R=3 < 91, R=4 < 143 us",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 242,
+   "after": 241,
+   "result": "stress 0 bad R=2..4; multi down R2 35.8 (46.1), R3 52.2 (91.1), R4 70.7 (143.4) us; exchange R2 238.6, R3 336.9, R4 432.1 us; per_row unchanged 150 us; MTP k1 natural 15.250 s = 65.6 tok/s"
+  },
+  {
+   "label": "fastdown_N_k2_20261104_v1",
+   "what": "natural k2",
+   "pre_reg": "> 61.4",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 243,
+   "after": 242,
+   "result": "15.283 s = 65.4 tok/s"
+  },
+  {
+   "label": "fastdown_H_k3_20261104_v1",
+   "what": "humaneval ignore_eos k3",
+   "pre_reg": "> 83.0",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 244,
+   "after": 243,
+   "result": "11.154 s = 89.6 tok/s"
+  },
+  {
+   "label": "final_N_k3_20261104_v1",
+   "what": "final draft sweep cell (N-row exchange + fast-decode down + N-row LM head + combine 1024)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 245,
+   "result": "16.642 s = 60.1 tok/s, checks 8/8"
+  },
+  {
+   "label": "final_H_k1_20261104_v1",
+   "what": "final draft sweep cell (N-row exchange + fast-decode down + N-row LM head + combine 1024)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 246,
+   "result": "14.403 s = 69.4 tok/s, checks 8/8"
+  },
+  {
+   "label": "final_H_k2_20261104_v1",
+   "what": "final draft sweep cell (N-row exchange + fast-decode down + N-row LM head + combine 1024)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 247,
+   "result": "12.105 s = 82.6 tok/s, checks 8/8"
+  },
+  {
+   "label": "outer_ab_off_20261104_v1",
+   "what": "reference without outer multicast: MTP k2 natural + harness R=1..4 (checksums) + LM check rows 2-4 (lse checksums)",
+   "pre_reg": "as before; checksums recorded",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 248,
+   "result": "15.330 s = 65.2 tok/s (k2 natural); publish R1..4 16.4/25.6/34.8/45.1 us; exchange 149.5/238.6/335.9/428.0 us; checksums R1..4 281261080933954/281052210223589/280868066456863/280639951919285; lse checksums 10954717444/16435591514/21911387174"
+  },
+  {
+   "label": "outer_ab_on_20261104_v1",
+   "what": "same with Q38_RTX_PEER_PEX_OUTER=1: outer PEX8748 group (ingress RTX port 02:13.0, egress 6 card ports, overlay = card MC windows, window 0x2380000000 in empty port 02:12.0); RTX publishes once",
+   "goal": "one publish instead of six, results identical",
+   "pre_reg": "OUTER_MC_ACTIVE + OUTER_MC_RESTORE PASS; mc_registers_unchanged over 39 ports; stress ref checksums and LM lse checksums equal to the off run; publish per layer R=1 < 10 us (16.4 off); t/s >= off",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 249,
+   "after": 248,
+   "result": "14.704 s = 68.0 tok/s; OUTER_MC_ACTIVE 0x2380000000, OUTER_MC_RESTORE PASS, mc_registers_unchanged (39 ports), 49/49 request leaves restored, 8/8 checks; all stress and lse checksums identical to the off run; publish R1..4 7.2/8.2/10.2/11.3 us; exchange 141.3/221.2/310.3/395.8 us"
+  },
+  {
+   "label": "outer_final_N_k0_20261104_v1",
+   "what": "final run with the outer PEX8748 multicast group",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 250,
+   "result": "18.210 s = 54.9 tok/s (53.4 without outer); 8/8 checks, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "outer_final_N_k1_20261104_v1",
+   "what": "final run with the outer PEX8748 multicast group",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 251,
+   "result": "14.743 s = 67.8 tok/s (65.6); 8/8 checks, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "outer_final_H_k3_20261104_v1",
+   "what": "final run with the outer PEX8748 multicast group",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 252,
+   "result": "10.670 s = 93.7 tok/s (89.6); 8/8 checks, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "finish_ts_reload_20261104_v1",
+   "what": "cubins with leader/peer finish timestamps in t_extra (modes 1 and 10)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 253,
+   "result": "reloaded"
+  },
+  {
+   "label": "finish_ts_profile_20261104_v1",
+   "what": "harness R=1,2,4 per_row/multi with the finish split (leader flags seen / block-0 sum+write / barrier+ack; peer push), outer multicast on",
+   "goal": "how the ~33 us leader finish splits",
+   "pre_reg": "split sums to the leader finish; mode-1 timing unchanged (crit ~100 us); stress 0 bad",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 254,
+   "after": 253,
+   "result": "8/8 checks, stress 0 bad (R=1,2 checksums = T248/T249; R=4 inputs differ since R=3 was skipped). Leader finish 1 row 32.8 us = wait flags 17.4 + sum/write 12.3 + barrier/ack 3.1; peer push 10.2. 2 rows: 19.5 / 29.7 / 3.1; 4 rows: 31.7 / 64.6 / 3.1. Mode 1 unchanged (crit 100.4). Sum/write grows ~16 us per row: 9 data rows x 10 KB per layer into the RTX x4 link (inference)"
+  },
+  {
+   "label": "stream_poc_reload_20261104_v1",
+   "what": "cubins with the streamed-finish PoC in mode 10 (per-block flags, no barrier between down and finish; off unless the MR block has the stream bit)",
+   "pre_reg": "reload OK",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 255,
+   "result": "reloaded"
+  },
+  {
+   "label": "stream_poc_off_20261104_v1",
+   "what": "PoC A: stream off; harness R=1,2,4 per_row vs multi (mode 10 incl. 1 row via MULTIROW_MIN=1), stress, outer on",
+   "pre_reg": "multi R=1 ~ per_row (~141 us), R=2 ~221, R=4 ~396",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 256,
+   "after": 255,
+   "result": "8/8; stream 0; multi R1/2/4 141.3/221.2/400.4 us, leader finish 32.3/52.2/100.4; checksums 281261080933954/281052210223589/280651386992651, stress 0 bad"
+  },
+  {
+   "label": "stream_poc_on_20261104_v1",
+   "what": "PoC B: same with Q38_RTX_PEER_MR_STREAM=1",
+   "goal": "hypothesis: streamed finish saves ~15-20 us per layer per row",
+   "pre_reg": "stress 0 bad, checksums = A; multi R=1 <= 126 us, R=2 <= 200, R=4 <= 340",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 257,
+   "after": 256,
+   "result": "8/8; stream 1; multi R1/2/4 133.1/206.8/379.9 us (-8.2/-14.4/-20.5), leader finish 26.6/43.5/83.5, wait flags 14.3/14.3/17.4; same checksums, stress 0 bad. Hypothesis (15-20 us per layer per row) confirmed in direction, about half the size; made default"
+  },
+  {
+   "label": "stream_final_N_k0_20261104_v1",
+   "what": "tok/s with streamed finish as default (+ 1-row decode via mode 10), outer multicast",
+   "pre_reg": "> 54.9",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 258,
+   "result": "17.937 s = 55.7 tok/s (54.9 T250); 8/8 checks, stream 1, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "stream_final_N_k1_20261104_v1",
+   "what": "tok/s with streamed finish as default (+ 1-row decode via mode 10), outer multicast",
+   "pre_reg": "> 67.8",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 259,
+   "result": "14.388 s = 69.5 tok/s (67.8 T251); 413/587 accepted (= T251); 8/8 checks, stream 1, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "stream_final_N_k2_20261104_v1",
+   "what": "tok/s with streamed finish as default (+ 1-row decode via mode 10), outer multicast",
+   "pre_reg": "> 68.0",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 260,
+   "result": "14.324 s = 69.8 tok/s (68.0 T249); 536/926 (= T249); 8/8 checks, stream 1, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "stream_final_H_k3_20261104_v1",
+   "what": "tok/s with streamed finish as default (+ 1-row decode via mode 10), outer multicast",
+   "pre_reg": "> 93.7",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 261,
+   "result": "10.434 s = 95.8 tok/s (93.7 T252); 741/783 (= T252); 8/8 checks, stream 1, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_A_6grp_split_20261104_v1",
+   "what": "A: outer off, 6 payloads then 6 go words (two kernels; current non-outer path). publish order experiment (user hypothesis 2026-11-04: first card should get its go ASAP, returns spread out). Same harness as T257 (R=1,2,4 multi, stress 3); compare rtx_multi total/wait_acks and workers critical.",
+   "pre_reg": "reference for B/C; R=1 total ~3-8 us above D (6x payload over x4)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 262,
+   "result": "R1/2/4 total 142.3/224.8/413.7 us; crit 92.2/149.5/289.8; bit-identical (ref checksums equal across all 5, 0 bad rows)"
+  },
+  {
+   "label": "pubord_B_6grp_pergo_20261104_v1",
+   "what": "B: outer off, 6 blocks, each payload+go for its card in one kernel. publish order experiment (user hypothesis 2026-11-04: first card should get its go ASAP, returns spread out). Same harness as T257 (R=1,2,4 multi, stress 3); compare rtx_multi total/wait_acks and workers critical.",
+   "pre_reg": "R=1 total 2-5 us below A (doorbell kernel gone, no card waits for other payloads); bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 263,
+   "result": "R1/2/4 total 140.3/222.2/412.7 us (-2/-3/-1 vs A); crit unchanged; bit-identical (ref checksums equal across all 5, 0 bad rows)"
+  },
+  {
+   "label": "pubord_C_serial_012345_20261104_v1",
+   "what": "C: outer off, 1 block serial, card 0 payload+go first ... shared card 5 last (slowest=routed first). publish order experiment (user hypothesis 2026-11-04: first card should get its go ASAP, returns spread out). Same harness as T257 (R=1,2,4 multi, stress 3); compare rtx_multi total/wait_acks and workers critical.",
+   "pre_reg": "R=1 total <= B; gain over B only if return congestion on the x4 link matters (upper bound ~publish spread, ~5 us)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 264,
+   "result": "R1/2/4 total 139.3/212.0/368.6 us; worker crit 87.0/141.3/250.9 (-5/-8/-39 vs A); beats D at R4 (-12) but not R1/R2 (+6) because serial publish = 41/52/71 us; bit-identical (ref checksums equal across all 5, 0 bad rows)"
+  },
+  {
+   "label": "pubord_C_serial_501234_20261104_v1",
+   "what": "C': as C but shared card 5 first (contrast to slowest-first). publish order experiment (user hypothesis 2026-11-04: first card should get its go ASAP, returns spread out). Same harness as T257 (R=1,2,4 multi, stress 3); compare rtx_multi total/wait_acks and workers critical.",
+   "pre_reg": "total >= C (shared busy 75.8 < routed critical 91.1 us, T257)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 265,
+   "result": "R1/2/4 total 143.4/208.9/380.9 us; shared-first worse than routed-first at R1 (+4) and R4 (+12), R2 -3 (noise); bit-identical (ref checksums equal across all 5, 0 bad rows)"
+  },
+  {
+   "label": "pubord_D_outer_20261104_v1",
+   "what": "D: outer multicast (current default), same session. publish order experiment (user hypothesis 2026-11-04: first card should get its go ASAP, returns spread out). Same harness as T257 (R=1,2,4 multi, stress 3); compare rtx_multi total/wait_acks and workers critical.",
+   "pre_reg": "= T257 within noise: R=1 total ~133 us",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 266,
+   "result": "R1/2/4 total 133.1/205.8/380.4 us (= T257); OUTER_MC_RESTORE PASS; bit-identical (ref checksums equal across all 5, 0 bad rows)"
+  },
+  {
+   "label": "pubord_E_outer_stagger_gap0_20261104_v1",
+   "what": "E0: order 3, go gap 0 ns. Outer multicast payload once, then go words card by card (routed 0..4 first, shared 5 last) via the per-card group mappings (no new routes/records). Same harness as T262-T266.",
+   "pre_reg": "R1 total <= D (133.1, T266) - 2 us; worker crit ~ D (stagger only ~1 us)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 267,
+   "result": "R1/2/4 total 138.2/202.8/377.9 us (vs D ref2 133.1/206.3/380.4); go kernel 16.4 us (6 cards x 2 system fences) vs 4.1; crit 93.2/143.4/285.7; bit-identical (ref checksums = T262-T266, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_E_outer_stagger_gap3000_20261104_v1",
+   "what": "E3: order 3, go gap 3000 ns. Outer multicast payload once, then go words card by card (routed 0..4 first, shared 5 last) via the per-card group mappings (no new routes/records). Same harness as T262-T266.",
+   "pre_reg": "R4 crit below D (289.8) toward C (250.9); R1 total within +-5 us of D",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 268,
+   "result": "R1/2/4 total 139.3/200.7/377.3 us; go 29.7 us; crit 88.1/135.2/281.6; bit-identical (ref checksums = T262-T266, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_E_outer_stagger_gap7000_20261104_v1",
+   "what": "E7: order 3, go gap 7000 ns (~C spacing). Outer multicast payload once, then go words card by card (routed 0..4 first, shared 5 last) via the per-card group mappings (no new routes/records). Same harness as T262-T266.",
+   "pre_reg": "R4 total < D (380.4) by >= 10 us; R1 total > D (last card's go +35 us)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 269,
+   "result": "R1/2/4 total 149.5/218.1/370.7 us; go 50.2 us; crit 84.0/139.3/263.2; bit-identical (ref checksums = T262-T266, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_D_outer_ref2_20261104_v1",
+   "what": "D ref: outer default, same session. Outer multicast payload once, then go words card by card (routed 0..4 first, shared 5 last) via the per-card group mappings (no new routes/records). Same harness as T262-T266.",
+   "pre_reg": "= T266 within noise",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 270,
+   "result": "R1/2/4 total 133.1/206.3/380.4 us (= T266); bit-identical (ref checksums = T262-T266, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_L_lowfence_gap0_20261104_v1",
+   "what": "L0: low-fence, gap 0. Publish order 3 with Q38_RTX_PEER_GO_LOWFENCE=1: outer multicast payload (+mode word, fenced), then only the sequence word per card (routed 0..4 first, shared 5 last), one fence at the end. Same harness as T262-T270.",
+   "pre_reg": "go kernel <= 5 us (vs 16.4 T267); R1 total = D (133.1, T270) +-2 us; no stagger effect; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 271,
+   "result": "R1/2/4 total 133.1/205.8/378.9 us; go 4.1 us (= multicast go; was 16.4 with fences T267); no stagger effect (crit = D); bit-identical (ref checksums = T262-T270, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_L_lowfence_gap3000_20261104_v1",
+   "what": "L3: low-fence, gap 3000 ns. Publish order 3 with Q38_RTX_PEER_GO_LOWFENCE=1: outer multicast payload (+mode word, fenced), then only the sequence word per card (routed 0..4 first, shared 5 last), one fence at the end. Same harness as T262-T270.",
+   "pre_reg": "go ~16 us; R2 total <= 200 us (E3 200.7, T268); R1 total <= D + 3; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 272,
+   "result": "R1/2/4 total 138.2/201.7/377.9 us; go 17.4-18.4; crit 92.2/142.3/285.7; bit-identical (ref checksums = T262-T270, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_L_lowfence_gap5000_20261104_v1",
+   "what": "L5: low-fence, gap 5000 ns. Publish order 3 with Q38_RTX_PEER_GO_LOWFENCE=1: outer multicast payload (+mode word, fenced), then only the sequence word per card (routed 0..4 first, shared 5 last), one fence at the end. Same harness as T262-T270.",
+   "pre_reg": "go ~26 us; R4 total <= 370 us (E7 370.7, T269); R1 > D; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 273,
+   "result": "R1/2/4 total 138.2/199.7/373.8 us; go 27.6-28.7; crit 89.1/136.2/279.6; bit-identical (ref checksums = T262-T270, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "pubord_D_outer_ref3_20261104_v1",
+   "what": "D ref: outer default, same session. Publish order 3 with Q38_RTX_PEER_GO_LOWFENCE=1: outer multicast payload (+mode word, fenced), then only the sequence word per card (routed 0..4 first, shared 5 last), one fence at the end. Same harness as T262-T270.",
+   "pre_reg": "= T270 within noise; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 274,
+   "result": "R1/2/4 total 133.1/206.3/380.9 us (= T270); bit-identical (ref checksums = T262-T270, 0 bad rows), OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "ackprof_D_outer_20261104_v1",
+   "what": "Q38_RTX_PEER_ACK_PROFILE=1 on the outer default (D): round-robin pre-poll of the 24 headers records when the 9 data headers (5 leaders + 4 shared) were complete vs all 24, and which header came last. User idea: combine after the 9 data headers, check the 15 peer acks later.",
+   "pre_reg": "peers_after_data9 median small (<= 3 us) at R1, because peers push to the leader before they ack; last header mostly a card leader or shared worker; totals = T274 +-3 us; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 275,
+   "result": "peers_after_data9 median 0.0 us at R1/2/4 (max 1.0 us = timer step; 0 in 40/48, 38/48, 33/45 exchanges); last header: leader 4 (card 1) 23x, 8 (card 2) 13x, 12 (card 3) 8x at R1, almost always a card leader at R2/R4. => combine-before-peer-acks saves ~0. Profile cost: total 138.2/212.5/385.0 vs T274 133.1/206.3/380.9. Bit-identical, OUTER_MC_RESTORE PASS"
+  },
+  {
+   "label": "diag_kreload_20261104_v1",
+   "what": "kernel reload (park + RELOAD_KERNELS) with Q38_MR_FLAG_DIAG_NORTX support in routed v3 / shared v2 (off unless the MR block sets bit 2)",
+   "pre_reg": "PASS, daemon keeps running, 49 layers ready",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 276,
+   "result": "KERNELS_RELOADED generation 10; layers_ready 49 before/after (script prints a hardcoded 'layers,48'); only source diff vs reload 200431Z = the diag gate"
+  },
+  {
+   "label": "diag_ref_newkern_20261104_v1",
+   "what": "reference on the reloaded kernels, diagnostic off, outer default (D settings)",
+   "pre_reg": "= T274 (133.1/206.3/380.9 us) +-3 us; ref checksums = T262-T275; 0 bad rows",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pueue_task": 277,
+   "result": "exit 90: GPU-driven exchange failed reason 2 (deadline), layer 5, worker 16 (card 4 leader), status 0, during vLLM determine_available_memory (before the timing harness). Teardown then hit a daemon state-file race (atomic_json tmp name = pid only: FileNotFoundError on resident_state.json.866033.tmp) -> daemon ERROR_CLEANUP, MoE socket closed, manager pool shut down, recover-peer-client impossible. PRESERVE: ACS temporary (acs-route-20261104T215536Z, 29 controls), rtx_mc_dma_map kept. MC RESTORE PASS, OUTER_MC_RESTORE PASS. UVM lifecycle released 49 dead RTX VA-space records 22:56:27. No AER/Xid. No retry."
+  },
+  {
+   "label": "diag_nortx_20261104_v1",
+   "what": "DIAGNOSTIC Q38_RTX_PEER_MR_DIAG_NORTX=1: card leaders + shared workers skip their result writes to the RTX (headers/acks/peer pushes unchanged; results invalid). Tests whether the leader sum+write (21.5/34.8/79.9 us, T275) is the RTX x4 link drain.",
+   "pre_reg": "link-bound: leader_sum_write_b0 <= 5/8/15 us at R1/2/4 and wait_acks down by ~15/30/65 us vs ref; not link-bound: sum_write stays >= 15 us at R1. bad_rows > 0 expected (results invalid)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pueue_task": 278,
+   "result": "exit 3 at precheck: 'daemon socket or input missing' (daemon in ERROR_CLEANUP); no hardware touched; diagnostic not measured"
+  },
+  {
+   "label": "daemon_start_49_postincident_20261104_v1",
+   "what": "fresh 49-layer daemon after the T277 incident (manual recovery done: ACS, DMA helper, PEX groups 0-5 restored; UVM records released); includes the atomic_json race fix and the diag-gated worker kernels (gate off)",
+   "pre_reg": "READY, layers_ready 49, workers PARKED",
+   "runner": "src/run_qwen38_full_daemon_start.sh",
+   "status": "success",
+   "pueue_task": 279,
+   "result": "READY, 49 layers, PARKED, pid 1131168; kernel generation 1, routed_v3 sha ae569b7e... (= T276 reload)"
+  },
+  {
+   "label": "diag_ref_newkern_20261104_v2",
+   "what": "reference run (diag off) on a fresh daemon. Requeue of T277 with named root causes: T277 = card 4 routed kernels (GPUs 16-19) exited before the exchange (cause unknown) + daemon state-file race (fixed). Checks whether the card-4 exit reproduces.",
+   "pre_reg": "PASS; = T274 (133.1/206.3/380.9 us) +-3 us; ref checksums = T262-T275; 0 bad rows. If card 4 exits again: reason-2 at worker 16-19 -> investigate kernels before any diagnostic",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 280,
+   "result": "PASS: R1/2/4 total 132.1/204.8/379.9 us (T274 133.1/206.3/380.9); leader sum+write 20.5/35.8/80.9 us; ref checksums = T262-T275, 0 bad rows; ACS/MC/outer restores PASS. Card-4 exit of T277 did not reproduce."
+  },
+  {
+   "label": "diag_nortx_20261104_v2",
+   "what": "DIAGNOSTIC Q38_RTX_PEER_MR_DIAG_NORTX=1 (requeue of T278: refused at precheck because the daemon was down after the T277 incident). Card leaders + shared workers skip result writes to the RTX; results invalid.",
+   "pre_reg": "link-bound: leader_sum_write_b0 <= 5/8/15 us at R1/2/4 (T280: 20.5/35.8/80.9) and wait_acks down ~15/30/65 us; not link-bound: sum_write >= 15 us at R1. bad_rows > 0 expected",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 281,
+   "result": "vs T280: leader sum+write R1 20.5->20.5, R2 35.8->21.0, R4 80.9->27.6 us; total R1 132.1->130.0, R2 204.8->185.3, R4 379.9->325.6; crit 91.1/148.5/289.8 -> 87.0/127.0/233.5; shared busy 75.8/93.2/154.6 -> 61.4/67.6/101.4. => link drain dominates for R>=2, NOT at R1 (fixed ~20 us leader finish cost remains). bad_rows 141/288/576 as expected (results invalid); restores PASS"
+  },
+  {
+   "label": "prof_kreload_20261104_v1",
+   "what": "kernel reload with Q38_RELOAD_NVCC_FLAGS=-DQ38_MR_PROFILE_BUILD (leader-finish profile; main kernel 40 B frame / 60/92 B spill vs default 24/28/40)",
+   "pre_reg": "KERNELS_RELOADED, routed sha 030fd9ed...",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 282,
+   "result": "KERNELS_RELOADED, routed sha 030fd9ed... (profile build)"
+  },
+  {
+   "label": "prof_off_profkern_20261104_v1",
+   "what": "profile-build kernels, profile bit off: cost of the build change alone",
+   "pre_reg": "= T280 (132.1/204.8/379.9 us) within +-3 us; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 283,
+   "result": "R1/2/4 total 133.1/206.8/379.9 us (= T280): the profile build's larger main-kernel spill costs nothing measurable; bit-identical"
+  },
+  {
+   "label": "prof_on_20261104_v1",
+   "what": "Q38_RTX_PEER_MR_PROFILE=1: card leaders record reads / local write / RTX write issue / fence of their finish (block barriers between phases)",
+   "pre_reg": "phases sum ~ leader sum+write (20.5/35.8/80.9 us, T280) + barrier overhead; at R1 the fixed ~20 us (T281) shows up in reads or fence, not in the RTX write issue; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 284,
+   "result": "leader block-0 phases R1/2/4 (us): reads 2.0/3.1/5.1, local write 0.0/0.0/0.0, RTX write issue 0.0/0.0/0.0, fence 4.1/14.3/49.2 (n=240 each). Harness field leader_sum_write_b0 INCLUDES the peer-flag wait (t_sm - t_down): leader finish R1 = flags 12-14 + own sum/write/fence 6-8 + barrier/ack 5. => R1 cost is the wait for the peers' push + fence + flag (peer_push_b0 11-12 us); R>=2 cost is the leader's fence = RTX link drain. Total +4 us at R2/R4 from the extra barriers; bit-identical"
+  },
+  {
+   "label": "default_kreload_20261104_v1",
+   "what": "reload the default build again (no extra flags)",
+   "pre_reg": "KERNELS_RELOADED, routed sha ae569b7e... (= daemon start T279)",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 285,
+   "result": "KERNELS_RELOADED, routed sha ae569b7e... (default build restored)"
+  },
+  {
+   "label": "ll_kreload_20261104_v1",
+   "what": "kernel reload with -DQ38_MR_LL_BUILD (LL peer push PoC; main kernel spill unchanged 24/28/40)",
+   "pre_reg": "KERNELS_RELOADED, routed sha 4f2e422b...",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 286,
+   "result": "KERNELS_RELOADED, routed sha 4f2e422b... (LL build)"
+  },
+  {
+   "label": "ll_off_llkern_20261104_v1",
+   "what": "LL build, LL bit off (same-kernel reference)",
+   "pre_reg": "= T280 (132.1/204.8/379.9 us) +-3; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 287,
+   "result": "R1/2/4 total 133.1/206.8/379.9 us (= T280); bit-identical"
+  },
+  {
+   "label": "ll_on_20261104_v1",
+   "what": "Q38_RTX_PEER_MR_LL=1: R=1 peers push {value,seq} 8-byte stores without fence/flag; leader polls per element; R>=2 unchanged + LL-area clear and one extra grid barrier",
+   "pre_reg": "R1: leader finish 26.6 -> 16-20 us, total 132 -> 122-127 us (estimate -6..-10); R2/R4 total +0..+4 us (clear + barrier); bit-identical (same checksums, 0 bad rows)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 288,
+   "result": "R1 total 133.1->130.0 (-3.1), crit 91.1->85.0, leader finish 26.6->21.5, peer finish 18.4->4.1 (peer push 11.3->1.0); leader fence/RTX-write phase 7.2->12.3 (all leaders now drain into the x4 link together). R2 total 206.8->214.0 (+7.2), R4 379.9->387.1 (+7.2): the R>=2 LL-area clear + extra grid barrier (barrier/ack 3.1->11.3/9.2). Bit-identical (same checksums, 0 bad rows). Below the pre-registered -6..-10 us at R1; R>=2 penalty above the +0..+4 expected."
+  },
+  {
+   "label": "default_kreload_20261104_v2",
+   "what": "reload the default build again",
+   "pre_reg": "KERNELS_RELOADED, routed sha ae569b7e...",
+   "runner": "src/run_pci_cluster_kernel_reload.sh",
+   "status": "success",
+   "pueue_task": 289,
+   "result": "KERNELS_RELOADED, routed sha ae569b7e... (default restored)"
+  },
+  {
+   "label": "m10_compute_bench_20261105_v1",
+   "what": "standalone 1-row routed-expert compute microbenchmark on one M10 GM107 (src/bench_m10_expert_compute.cu): deployed dynamic_gate_layer/dynamic_down_layer vs hoisted / paired gate-up, 2-expert / transposed-layout / 4-thread-split down, at 10/20/40 blocks (128/64/32 register caps); synthetic 126 MB layer, 64 expert sets, 2000 iterations; bit-identity vs deployed",
+   "pre_reg": "deployed b10: gate/up 28-34 us (T275 33.8 incl. staging+barrier), down 18-22 us (T275 21.5); hoist or pair gate/up 20-35 % faster at b10; transposed down 20-40 % faster; b20 faster than b10 for gate/up; b40 (32 regs) spills, likely no better; all variants bit-identical",
+   "runner": "$M10DIS_RUNS/m10-compute-bench/20261104T232637Z/bench_m10_expert_compute",
+   "status": "success",
+   "pueue_task": 290,
+   "result": "device 0000:05:00.0 (mem 2600 MHz x 128 bit = 83.2 GB/s peak). b10 (us, median): deployed gate/up 32.77 (51 GB/s), down 23.55 all blocks / 19.46 block 0 (40 GB/s) = production T275 33.8/21.5; grid barrier ~2.0 us (no-down variant). hoist+k2: 31.74 / 21.50 (bit-identical). pair gate/up + transposed down: 30.72 / 19.46 all, 16.38 block 0 (55 / 46 GB/s, bit-identical). All 20/40-block variants SKIPPED: max 3 blocks/SM (shared memory: q38_routed_xbuf 2*H floats ~ 21-24 KB per block), not registers. Result: -2 us gate/up, -4 us down at the deployed 10-block config."
+  },
+  {
+   "label": "m10_compute_bench_20261105_v2",
+   "what": "compute microbenchmark extended: 1-row x buffer (10 KB, if constexpr so variants only allocate what they use) -> up to 5 blocks/SM; deployed gate/up math and pair gate/up at 10/15/20/25 blocks; down: deployed, transposed, 2-threads-per-row split (bit-identical chain order)",
+   "pre_reg": "prodsmall b10 = deployed b10 (32.8 / 23.6 us); gate/up at b20 20-30 % faster than b10 (more warps hide latency), b25 no better (48-51 regs, spills for pair); split2 down at b20 25-40 % faster than deployed down; best combination gate/up + down <= 42 us vs 56.4 (deployed); all bit-identical",
+   "runner": "$M10DIS_RUNS/m10-compute-bench/20261104T233137Z/bench_m10_expert_compute",
+   "status": "success",
+   "pueue_task": 291,
+   "result": "means (us, gate/up + down incl. grid barriers): deployed b10 33.12+23.18=56.30; 1-row buffer b10 31.44+21.03=52.48, b15 51.75, b20 51.34, b25 51.59; pair+trans b10 50.50; split2 down b20 50.30; pair+trans b20 50.33. Occupancy (16->40 warps/SM) adds ~nothing beyond the ILP variants: gate/up floors at ~30 us (~56 GB/s, 67 % of 83.2 GB/s peak; ~60 GB/s without barrier+staging), down at ~20 us (~46 GB/s). Same gate/up code differs ~2 us with/without the following down (31.25 vs 33.12), so 1-2 us differences are at the noise level. All variants bit-identical. => the 1-row compute is near the M10's practical bandwidth; realistic gain ~6 us/layer."
+  },
+  {
+   "label": "pubgo_ref_20261105_v1",
+   "what": "reference for the publish+go merge: outer default, publish order 0 (begin, publish, publish_sequence = 3 kernels)",
+   "pre_reg": "= T280 (132.1/204.8/379.9 us) +-3; bit-identical",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 292,
+   "result": "R1/2/4 total 133.1/204.8/380.9 us (publish 7.2/8.2/11.3 + doorbell 4.1); bit-identical"
+  },
+  {
+   "label": "pubgo_merge_20261105_v1",
+   "what": "Q38_RTX_PEER_PUBLISH_ORDER=4: begin + publish + go in one kernel (outer group), no repeated mode write / trailing fences",
+   "pre_reg": "total -3..-6 us per layer at R1/2/4 vs pubgo_ref (publish+doorbell 11.3 -> 5-8 us); wait/combine unchanged; bit-identical (same checksums, 0 bad rows)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 293,
+   "result": "R1/2/4 total 128.0/200.7/374.8 us (-5.1/-4.1/-6.1): publish+go 4.1/6.1/9.2 us (was 11.3/12.3/15.4), wait +2.1/+3.0/+0.5; same checksums, 0 bad rows. Within the pre-registered -3..-6."
+  },
+  {
+   "label": "pubgo_tps_ref_k0_20261105_v1",
+   "what": "tok/s reference, natural prompt, 1000 tokens, MTP k=0, publish order 0 (same session as the merge run)",
+   "pre_reg": "= 55.7 (T258) +-1.5 %",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 294,
+   "result": "55.40 tok/s (18.051 s, 1000 tokens; T258 55.75); tokens sha 6815ea92"
+  },
+  {
+   "label": "pubgo_tps_merge_k0_20261105_v1",
+   "what": "tok/s with Q38_RTX_PEER_PUBLISH_ORDER=4 (begin+publish+go merged), natural prompt, 1000 tokens, MTP k=0",
+   "pre_reg": "+1.5..+3 % vs the same-session reference (harness -4..-6 us per layer, T293; less if the CUDA graph already hides kernel boundaries); same tokens as the reference",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 295,
+   "result": "56.43 tok/s (17.720 s; +1.9 % vs T294); tokens identical to T294"
+  },
+  {
+   "label": "pubgo_tps_ref_k2_20261105_v1",
+   "what": "tok/s reference, natural prompt, 1000 tokens, MTP k=2, publish order 0 (same session as the merge run)",
+   "pre_reg": "= 69.8 (T260) +-1.5 %",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 296,
+   "result": "69.87 tok/s (14.312 s; T260 69.81); tokens sha cc105b8d"
+  },
+  {
+   "label": "pubgo_tps_merge_k2_20261105_v1",
+   "what": "tok/s with Q38_RTX_PEER_PUBLISH_ORDER=4 (begin+publish+go merged), natural prompt, 1000 tokens, MTP k=2",
+   "pre_reg": "+1.5..+3 % vs the same-session reference (harness -4..-6 us per layer, T293; less if the CUDA graph already hides kernel boundaries); same tokens as the reference",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 297,
+   "result": "68.87 tok/s (14.519 s; -1.4 % vs T296); tokens identical to T296. Single runs: inconclusive, repeats needed"
+  },
+  {
+   "label": "pubgo_tps_ref_k0_20261105_r2",
+   "what": "tok/s repeat 2 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 298,
+   "result": "55.28 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k0_20261105_r2",
+   "what": "tok/s repeat 2 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 299,
+   "result": "56.19 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_ref_k0_20261105_r3",
+   "what": "tok/s repeat 3 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 300,
+   "result": "55.98 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k0_20261105_r3",
+   "what": "tok/s repeat 3 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 301,
+   "result": "55.96 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_ref_k0_20261105_r4",
+   "what": "tok/s repeat 4 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 302,
+   "result": "55.88 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k0_20261105_r4",
+   "what": "tok/s repeat 4 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=0, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 303,
+   "result": "55.82 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_ref_k2_20261105_r2",
+   "what": "tok/s repeat 2 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 304,
+   "result": "69.57 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k2_20261105_r2",
+   "what": "tok/s repeat 2 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 305,
+   "result": "69.96 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_ref_k2_20261105_r3",
+   "what": "tok/s repeat 3 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 306,
+   "result": "69.81 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k2_20261105_r3",
+   "what": "tok/s repeat 3 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 307,
+   "result": "70.29 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_ref_k2_20261105_r4",
+   "what": "tok/s repeat 4 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 0",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 308,
+   "result": "69.74 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_merge_k2_20261105_r4",
+   "what": "tok/s repeat 4 (alternating ref/merge), natural prompt, 1000 tokens, MTP k=2, publish order 4",
+   "pre_reg": "merge vs ref mean over 4 pairs (incl. T294-T297): k0 +1..+3 %, k2 -1..+2 % (single pair k2 -1.4 %); identical tokens within each k",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 309,
+   "result": "70.22 tok/s; tokens identical to the other runs of this k"
+  },
+  {
+   "label": "pubgo_tps_summary_20261105",
+   "what": "publish+go merge, 4 alternating pairs per k (T294-T309)",
+   "pre_reg": "see per-run records",
+   "status": "summary",
+   "result": "k0: ref mean 55.63 (sd 0.35), merge 56.10 (sd 0.27): +0.84 % (paired +1.9/+1.6/-0.0/-0.1). k2: ref 69.75 (sd 0.13), merge 69.84 (sd 0.66): +0.13 % (paired -1.4/+0.6/+0.7/+0.7). Tokens identical in all 8 runs per k (k0 6815ea92, k2 cc105b8d). Harness -4..-6 us/layer (T293) predicted ~+1.3 % at k0; the CUDA graph hides part of the kernel boundaries."
+  },
+  {
+   "label": "pubgo_default_verify_20261105_v1",
+   "what": "publish order 4 as the default: harness run with NO Q38_RTX_PEER_PUBLISH_ORDER set (outer on)",
+   "pre_reg": "RTX_PEX_PUBLISH_ORDER,4 logged; = T293 (128.0/200.7/374.8 us) +-3; same checksums, 0 bad rows",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "queued"
+  },
+  {
+   "label": "ksweep_N_k0_20261105_v1",
+   "what": "K sweep on current defaults (streamed finish, outer group, merged publish+go): natural prompt, 1000 tokens, MTP k=0",
+   "pre_reg": "56.1 (pubgo merge mean) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 311,
+   "result": "56.27 tok/s (17.77 s)"
+  },
+  {
+   "label": "ksweep_N_k1_20261105_v1",
+   "what": "K sweep on current defaults (streamed finish, outer group, merged publish+go): natural prompt, 1000 tokens, MTP k=1",
+   "pre_reg": "69.5-71 (T259 69.5 + merge) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 312,
+   "result": "69.84 tok/s; 587 drafts, 413 accepted (70.4 %), 1.70 tokens/step"
+  },
+  {
+   "label": "ksweep_N_k2_20261105_v1",
+   "what": "K sweep on current defaults (streamed finish, outer group, merged publish+go): natural prompt, 1000 tokens, MTP k=2",
+   "pre_reg": "69.8-71 (pubgo merge mean 69.84) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 313,
+   "result": "68.97 tok/s; accepted per position 69.8 / 46.0 % of drafts, 2.16 tokens/step"
+  },
+  {
+   "label": "ksweep_N_k3_20261105_v1",
+   "what": "K sweep on current defaults (streamed finish, outer group, merged publish+go): natural prompt, 1000 tokens, MTP k=3",
+   "pre_reg": "62-68 (last natural k3 60.1, before streamed finish / outer group) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 314,
+   "result": "64.25 tok/s; 67.1 / 45.2 / 25.5 %, 2.38 tokens/step"
+  },
+  {
+   "label": "ksweep_H_k0_20261105_v1",
+   "what": "K sweep on current defaults: humaneval32 prompt + ignore_eos, 1000 tokens, MTP k=0",
+   "pre_reg": "55-57 (ignore_eos, 1-row) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 315,
+   "result": "54.64 tok/s (prompt 265, ignore_eos)"
+  },
+  {
+   "label": "ksweep_H_k1_20261105_v1",
+   "what": "K sweep on current defaults: humaneval32 prompt + ignore_eos, 1000 tokens, MTP k=1",
+   "pre_reg": "70-74 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 316,
+   "result": "74.06 tok/s; 88.7 %, 1.89 tokens/step"
+  },
+  {
+   "label": "ksweep_H_k2_20261105_v1",
+   "what": "K sweep on current defaults: humaneval32 prompt + ignore_eos, 1000 tokens, MTP k=2",
+   "pre_reg": "85-90 (82.6 before outer/stream) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 317,
+   "result": "88.31 tok/s; 96.5 / 93.3 %, 2.90 tokens/step"
+  },
+  {
+   "label": "ksweep_H_k3_20261105_v1",
+   "what": "K sweep on current defaults: humaneval32 prompt + ignore_eos, 1000 tokens, MTP k=3",
+   "pre_reg": "95-98 (T261 95.8) tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pueue_task": 318,
+   "result": "96.32 tok/s; 96.6 / 95.8 / 91.6 %, 3.84 tokens/step"
   }
  ]
 }
