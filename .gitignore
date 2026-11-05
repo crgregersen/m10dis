@@ -18,3 +18,6 @@ __pycache__/
 /m10dis.local.env
 boot/results/
 boot/build/
+# macOS metadata
+.DS_Store
+._*
