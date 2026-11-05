@@ -47,6 +47,8 @@ Two small helper modules support this. `transport/rtx_mc_dma/` creates IOMMU/DMA
 
 The RTX keeps one device-side sequence counter for all operations. A request is written body first and its `seq` last. Workers poll the sequence word in their request page. Posted writes from one source to one destination arrive in order, so a worker that sees the new `seq` also sees the body.
 
+Since 2026-11-05 (mode 10 with the outer group, `Q38_RTX_PEER_PUBLISH_ORDER=4`) one RTX kernel does it all: thread 0 increments the sequence, all threads write the body, each thread fences (`__threadfence_system`), a block barrier, then thread 0 writes `seq`. The mode word is part of the body. Before, three kernels did this (begin, publish, then a separate mode + `seq` write with two fences); merging them saves 4–6 µs per layer (§9).
+
 Workers always take `last + 1`. In mode 9 the doorbell may already show `last + 2`.
 
 ## 5. Return slots and acknowledgements
@@ -91,3 +93,18 @@ The outer PEX8748 has the same Multicast capability. With `Q38_RTX_PEER_PEX_OUTE
 - ingress: the RTX's downstream port; egress: the six card ports, each with an overlay onto that card's own multicast window, so the card's PEX8747 then copies the write to its four GPUs.
 
 The RTX then publishes each request once (7 more 4-KiB leaves instead of 6 × 7 writes). Publish per MoE layer: 16.4 → 7.2 µs for one row, 45.1 → 11.3 µs for four. The runner's before/after register check covers the 9 outer ports too; results are bit-identical with and without it (same checksums of all 48 layers' outputs). The prefill host-read fan-out (24 GPUs reading the same rows from host memory) is still untouched.
+
+## 9. What limits the decode exchange
+
+Measurements of 2026-11-04/05 with the timing harness (1 / 2 / 4 rows per exchange, 48 layers, stress checks; every variant bit-identical to the deployed path). The switches are off by default unless marked; [INTERFACE.md](INTERFACE.md) lists them.
+
+| Experiment | Result | Runs |
+|---|---|---|
+| Go per card instead of one multicast go; card 0 first (or routed cards first, shared last) | The workers' critical path drops (−39 µs at 4 rows when each card's request and go are sent one after another), because the returns no longer meet on the RTX link at once. Writing the requests per card costs more than that at 1–2 rows; with the outer request and a staggered go only −3 to −7 µs at 2–4 rows and +5 µs at 1 row | `pubord_*` (T262–T274) |
+| When do the 15 peer acks arrive, relative to the 9 data headers? | Never last: a peer acks right after pushing to its leader, the leader writes only after summing. Combining before the peer acks would save ≈ 0 | `ackprof_D_outer` |
+| Leaders and shared workers skip their result writes to the RTX (diagnostic, results wrong) | −2 / −20 / −54 µs per layer at 1 / 2 / 4 rows: from 2 rows on the RTX's x4 link is the limit | `diag_nortx` v2 vs `diag_ref_newkern` v2 |
+| Phases of the leader's finish (profile build) | 1 row: the leader mostly waits for its peers (push + system fence + flag ≈ 11 µs). 2+ rows: its own fence = the drain into the RTX link (14 / 49 µs) | `prof_on` |
+| LL peer push (8-byte {value, seq} stores, no fence, no flag; 1 row) | Peer finish 18.4 → 4.1 µs, but the leaders then reach the RTX link together (their fence 7 → 12 µs): −3 µs at 1 row, +7 µs at 2+ rows (clearing the LL area) | `ll_off_llkern` / `ll_on` |
+| Begin + publish + go in one kernel (**default**) | −5.1 / −4.1 / −6.1 µs per layer; +0.8 % tok/s at 0 drafts, ≈ 0 at 2 | `pubgo_*` |
+
+Two conclusions. First, every PCIe link is shared: the RTX's x4 link carries every result row, every header and every request, so making one stage faster mostly moves the queue to that link. Second, a full reduction tree (card leaders summing across cards, so the RTX receives one row) only moves the same bytes onto card 0's port and adds a hop; it pays off only at 3–4 rows. A sum on the shared card (worker 20 adds the four shared rows inside card 5) would take 3 rows off the RTX link without touching a shared link.

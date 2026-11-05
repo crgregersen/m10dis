@@ -48,6 +48,32 @@
 #define Q38_MR_SLOT1_OFF 0x33000u
 #define Q38_MR_SLOT1_STRIDE 0x3000u
 #define Q38_MR_RECORD_SHIFT 0x3000u        // row-1 return record = row-0 record +/- 3 pages
+// Streamed finish (2026-11-04, default; PoC T256/T257): slot1_off bit 1 set by the peer open (off with Q38_RTX_PEER_MR_STREAM=0). Each peer block
+// writes its own output elements straight into the leader windows and then one flag word per block (row-0 window +
+// Q38_MR_BLOCK_FLAG_OFF + 4 * block); each leader block waits only for its block's flags, adds in the fixed order
+// and writes its elements to the RTX; no grid barrier between down and finish. Same sums, so bit-identical.
+#define Q38_MR_FLAG_STREAM 2u
+// Diagnostic only (2026-11-04, Q38_RTX_PEER_MR_DIAG_NORTX=1): reducers (card leaders, shared workers) skip their
+// result-element writes to the RTX records; headers / acks / peer pushes unchanged. Results are WRONG; it measures
+// how much of the leader finish is the RTX x4 link drain.
+#define Q38_MR_FLAG_DIAG_NORTX 4u
+// Leader-finish profile (2026-11-04, Q38_RTX_PEER_MR_PROFILE=1): card leaders run the finish loop with a block barrier
+// between its phases and record them in the worker timing record's t_checked (same sums, same order: bit-identical):
+// t_checked = Q38_MR_PROF_MAGIC << 56 | reads << 42 | local write << 28 | RTX write issue << 14 | fence, in 32 ns units
+// (14 bits each). Needs one element per thread (gridDim.x * blockDim.x == H); otherwise the normal loop runs.
+#define Q38_MR_FLAG_PROFILE 8u
+#define Q38_MR_PROF_MAGIC 0xA5ull
+// LL peer push PoC (2026-11-04, Q38_RTX_PEER_MR_LL=1, kernels built with -DQ38_MR_LL_BUILD; streamed finish, R = 1 only):
+// a card peer writes each element as ONE 8-byte store {float bits, seq} into the leader's rows->=1 peer block
+// (Q38_MR_PEER_BASE(k), mapped by the existing push1 route), with no system fence and no block flag; the leader
+// thread of that element polls until the tag equals seq, adds the peers in the fixed order (bit-identical) and
+// zeroes the 8 bytes. After an R >= 2 exchange the leader zeroes the first Q38_MR_LL_BYTES of each peer block
+// (row data there could otherwise look like a tag), fences and takes one more grid barrier before its ack.
+#define Q38_MR_FLAG_LL 16u
+#define Q38_MR_LL_BYTES (2560u * 8u)
+static_assert(Q38_MR_LL_BYTES <= Q38_MR_PEER_BLOCK_BYTES, "LL row inside a peer block");
+#define Q38_MR_BLOCK_FLAG_OFF 10272u
+#define Q38_MR_MAX_BLOCKS 16u
 #define Q38_MR_REASON_CONFIG 32768u        // R, BF16 format, MR block, role pointers, scratch, layer
 #define Q38_MR_REASON_ROWS 65536u          // an expert id or route of row 1 is invalid
 struct Q38MrBlock { uint32_t magic, role, slot1_off, slot1_stride; uint64_t ret1_va, push1_va; };

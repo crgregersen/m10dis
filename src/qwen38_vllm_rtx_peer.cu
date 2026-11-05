@@ -48,6 +48,7 @@ constexpr NvU32 kReturnWindowBytes = kReturnSpanBytes < (64u << 10) ? (64u << 10
 constexpr NvU32 kReturnSlotBytes = 256u << 10;
 constexpr NvU32 kAsyncStatusSlots = 64;
 constexpr NvU32 kPexGroups = 6;
+__device__ NvU32 g_q38_ack_profile = 0;   // Q38_RTX_PEER_ACK_PROFILE (see pci_cluster_ack_profile)
 constexpr NvU32 kPexPagesPerGroup = 7;   // + 0xC000..0xEFFF (multi-row rows 2-3, 2026-11-04)
 constexpr NvU32 kPexAliases = kPexGroups * kPexPagesPerGroup;
 constexpr NvU32 kPexWindowBytes = 64u << 10;
@@ -147,6 +148,12 @@ struct PeerState {
     NvU64 pex_outer_base = 0;
     const NvU64 *pub_aliases = nullptr;
     NvU32 pub_groups = 6;
+    // Q38_RTX_PEER_PUBLISH_ORDER: 4 (default since 2026-11-05) begin + publish + go in one kernel (outer group only;
+    // without it as 0); 0 begin, payload, go as separate kernels; 1 / 2 / 3: publish-order experiments (TRANSPORT.md)
+    NvU32 publish_order = 4;
+    NvU32 publish_seq = 0x543210u;
+    NvU32 go_gap_ns = 0;
+    NvU32 go_lowfence = 0;               // Q38_RTX_PEER_GO_LOWFENCE=1: publish order 3, sequence words only, one fence                 // Q38_RTX_PEER_GO_GAP_NS: publish order 3, spin between cards' go words       // Q38_RTX_PEER_PUBLISH_SEQ="0,1,2,3,4,5": serial group order (a permutation)             // Q38_RTX_PEER_PUBLISH_ORDER: 0 payloads then go, 1 per group parallel, 2 per group serial
     bool pex_multicast = false;
     bool direct_unicast_diagnostic = false;
     bool pex_quiesced = true;
@@ -711,6 +718,18 @@ static void setup_pex_routes(PeerState &s, const char *groups_path,
     CK(cudaMalloc(&s.device_pex_aliases,aliases.size()*sizeof(NvU64)));
     CK(cudaMemcpy(s.device_pex_aliases,aliases.data(),aliases.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
     s.pub_aliases=s.device_pex_aliases; s.pub_groups=kPexGroups;
+    {const char *po=std::getenv("Q38_RTX_PEER_PUBLISH_ORDER"); s.publish_order=po&&*po?NvU32(std::atoi(po)):4u;   // default 4 (T293, T294-T309)
+     if(s.publish_order>4)throw std::runtime_error("Q38_RTX_PEER_PUBLISH_ORDER must be 0..4");
+     {const char *gg=std::getenv("Q38_RTX_PEER_GO_GAP_NS"); s.go_gap_ns=gg&&*gg?NvU32(std::atoi(gg)):0u; if(s.go_gap_ns>50000)throw std::runtime_error("Q38_RTX_PEER_GO_GAP_NS > 50000");}
+     if(const char *q=std::getenv("Q38_RTX_PEER_PUBLISH_SEQ"); q&&*q){
+        NvU32 v=0,seen=0,n=0; for(const char *c=q;*c;c++){ if(*c==',')continue; const NvU32 g=NvU32(*c-'0');
+            if(g>=kPexGroups||(seen>>g&1u)||n>=kPexGroups)throw std::runtime_error("Q38_RTX_PEER_PUBLISH_SEQ must be a permutation of 0..5");
+            seen|=1u<<g; v|=g<<(4*n); n++; }
+        if(n!=kPexGroups)throw std::runtime_error("Q38_RTX_PEER_PUBLISH_SEQ must list all 6 groups"); s.publish_seq=v; }
+     {const char *ap=std::getenv("Q38_RTX_PEER_ACK_PROFILE"); const NvU32 on=ap&&*ap=='1'?1u:0u;
+      CK(cudaMemcpyToSymbol(g_q38_ack_profile,&on,sizeof(on))); std::fprintf(stderr,"RTX_ACK_PROFILE,%u\n",on);}
+     {const char *lf=std::getenv("Q38_RTX_PEER_GO_LOWFENCE"); s.go_lowfence=lf&&*lf=='1'?1u:0u;}
+     std::fprintf(stderr,"RTX_PEX_PUBLISH_ORDER,%u,seq,0x%06x,go_gap_ns,%u,lowfence,%u\n",s.publish_order,s.publish_seq,s.go_gap_ns,s.go_lowfence);}
     if (outer_routes) {
         CK(cudaMalloc(&s.device_pex_outer_aliases,outer_aliases.size()*sizeof(NvU64)));
         CK(cudaMemcpy(s.device_pex_outer_aliases,outer_aliases.data(),outer_aliases.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
@@ -882,6 +901,109 @@ __global__ static void pci_cluster_publish_sequence(const PeerState::GpuDev *d, 
         if (group == 0) { PciClusterTimingRec *r = pc_rec(d); if (r) r->t_seq = q38_globaltimer(); }
     }
 }
+// Publish order experiment (2026-11-04, Q38_RTX_PEER_PUBLISH_ORDER): payload AND go (mode word, sequence) per group
+// in one kernel. serial = 1: one block does group 0 (payload, fence, go), then group 1, ... so card 0 starts first and
+// the returns spread out; serial = 0: block g does group g (no group waits for the other groups' payloads).
+template <class Op>
+__global__ static void pci_cluster_publish_go(const PeerState::GpuDev *d, typename Op::Args a, const NvU64 *aliases, NvU32 layer, NvU32 serial, NvU32 order) {
+    const volatile PeerState::GpuDev *v = d;
+    if (v->cur_skip) return;
+    // serial: the i-th group to get payload + go is nibble i of order (default 0x543210 = card 0 first, shared card 5 last)
+    const NvU32 i0 = serial ? 0 : blockIdx.x, i1 = serial ? kPexGroups : blockIdx.x + 1;
+    for (NvU32 i = i0; i < i1 && i < kPexGroups; i++) {
+        const NvU32 group = serial ? (order >> (4 * i)) & 0xFu : i;
+        if (group >= kPexGroups) continue;
+        if (threadIdx.x == 0) {
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, layer)) = layer;
+            *rtx_pex_word(aliases, group, offsetof(PeerControlLayout, mode)) = Op::kMode;
+        }
+        Op::publish(a, aliases, group);
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            auto *control = reinterpret_cast<volatile NvU32 *>(aliases[group*kPexPagesPerGroup]);
+            control[2] = Op::kMode;
+            __threadfence_system();
+            control[0] = v->cur_seq;
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && (serial || blockIdx.x == 0)) {
+        PciClusterTimingRec *r = pc_rec(d); if (r) { r->t_pub = q38_globaltimer(); r->t_seq = r->t_pub; }
+    }
+}
+// Publish order 4 (2026-11-05, default since T294-T309): pci_cluster_begin + pci_cluster_publish + pci_cluster_publish_sequence in ONE
+// kernel (outer group only, 1 block): thread 0 does the begin logic, block barrier; all threads write the request;
+// each thread fences (system), block barrier; thread 0 writes the sequence word. The mode word (control[2]) is the
+// request header's mode field, written above before the fence, so the separate mode write + fence of
+// pci_cluster_publish_sequence are not repeated. Two kernel boundaries and one to two fences fewer per exchange.
+template <class Op>
+__global__ static void pci_cluster_begin_publish_go(PeerState::GpuDev *d, PeerState::GpuHost *h, typename Op::Args a,
+        const NvU64 *aliases, NvU32 layer) {
+    if (blockIdx.x) return;
+    __shared__ NvU32 skip_s;
+    if (threadIdx.x == 0) {                                           // = pci_cluster_begin
+        NvU32 skip = 0;
+        if (static_cast<volatile PeerState::GpuHost *>(h)->err) skip = 2;
+        else skip = Op::skip(a);
+        if (!skip) {
+            const NvU32 next = d->seq + 1;
+            if (!next || next == 0xffffffffu) { skip = 2; q38_gpu_fail(h, 6, layer, d->seq, 0, 0, 0); }
+            else { d->seq = next; d->cur_seq = next; d->calls++; }
+        } else if (skip == 1) d->skips++;
+        d->cur_skip = skip;
+        if (g_pc_timing) {
+            const NvU32 slot = d->pad[1]++;
+            d->pad[0] = slot;
+            PciClusterTimingRec *r = g_pc_timing + slot % g_pc_timing_cap;
+            r->layer = layer; r->seq = d->cur_seq; r->skip = skip;
+            r->t_pub = r->t_seq = r->t_ack = r->t_done = 0;
+            r->t_begin = q38_globaltimer();
+        }
+        __threadfence();
+        skip_s = skip;
+    }
+    __syncthreads();
+    if (skip_s) return;                                               // dummy / failed rows: no M10 traffic (as before)
+    if (threadIdx.x == 0) {                                           // = pci_cluster_publish, group 0 (outer)
+        *rtx_pex_word(aliases, 0, offsetof(PeerControlLayout, layer)) = layer;
+        *rtx_pex_word(aliases, 0, offsetof(PeerControlLayout, mode)) = Op::kMode;
+    }
+    Op::publish(a, aliases, 0);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        PciClusterTimingRec *r = pc_rec(d); if (r) r->t_pub = q38_globaltimer();
+        auto *control = reinterpret_cast<volatile NvU32 *>(aliases[0]);
+        control[0] = static_cast<const volatile PeerState::GpuDev *>(d)->cur_seq;   // the go
+        if (r) r->t_seq = q38_globaltimer();
+    }
+}
+// Publish order 3 (2026-11-04): payload once through the outer multicast group (pci_cluster_publish, 1 group), then
+// the go words (mode, sequence) card by card through the per-card group mappings, which stay installed when the
+// outer group is on. order = nibble list as for publish_go; gap_ns = spin between two cards' go words.
+// lowfence = 1: only the sequence word per card, no fences between cards. The mode word (control[2]) was already
+// written to every card by pci_cluster_publish through the outer group, which ends with __threadfence_system; that
+// fence plus the kernel boundary orders it before every sequence word (as in the default doorbell).
+__global__ static void pci_cluster_go_staggered(const PeerState::GpuDev *d, const NvU64 *card_aliases, NvU32 mode, NvU32 order, NvU32 gap_ns, NvU32 lowfence) {
+    const volatile PeerState::GpuDev *v = d;
+    if (v->cur_skip || blockIdx.x || threadIdx.x) return;
+    const NvU32 seq = v->cur_seq;
+    for (NvU32 i = 0; i < kPexGroups; i++) {
+        const NvU32 group = (order >> (4 * i)) & 0xFu;
+        if (group >= kPexGroups) continue;
+        if (i && gap_ns) { const unsigned long long t0 = q38_globaltimer(); while (q38_globaltimer() - t0 < gap_ns) {} }
+        auto *control = reinterpret_cast<volatile NvU32 *>(card_aliases[group*kPexPagesPerGroup]);
+        if (lowfence) { control[0] = seq; continue; }
+        control[2] = mode;
+        __threadfence_system();
+        control[0] = seq;
+        __threadfence_system();
+    }
+    if (lowfence) __threadfence_system();
+    PciClusterTimingRec *r = pc_rec(d); if (r) r->t_seq = q38_globaltimer();
+}
 // Thread 0 only: wait until every worker acknowledged the current sequence, with four exits
 // (cycle timeout, %globaltimer deadline, host abort flag, worker error status) and a header check.
 // Returns true on success; on failure records the sticky error (q38_gpu_fail).
@@ -921,6 +1043,36 @@ __device__ static bool pci_cluster_wait(const PeerState::GpuDev *d, PeerState::G
     return pci_cluster_wait_seq(static_cast<const volatile PeerState::GpuDev *>(d)->cur_seq, false, hst, return_slots, workers,
                                 layer, observed_headers, timeout_cycles, deadline_ns);
 }
+// Ack profile (2026-11-04, Q38_RTX_PEER_ACK_PROFILE=1): before the normal in-order wait, thread 0 polls all 24
+// headers round-robin and records when the data headers (card leaders = workers not in g_q38_agg_skip_mask, and the
+// shared workers 20..23) were complete and when all 24 were. rec->pad = min(t_all - t_data, 0xFFFFFF ns) |
+// (index of the last header seen) << 24. Measurement only: the normal wait then runs unchanged and validates.
+__device__ static void pci_cluster_ack_profile(const PeerState::GpuDev *d, const NvU64 *return_slots, NvU32 workers, NvU64 deadline_ns) {
+    if (workers != 24) return;
+    const NvU32 sequence = static_cast<const volatile PeerState::GpuDev *>(d)->cur_seq;
+#ifdef Q38_RTX_PEER_LEADER_AGG
+    const NvU32 data_mask = (~g_q38_agg_skip_mask & 0xFFFFFu) | 0xF00000u;
+#else
+    const NvU32 data_mask = 0xFFFFFFu;
+#endif
+    NvU32 seen = 0, last = 0;
+    unsigned long long t_data = 0;
+    const unsigned long long t0 = q38_globaltimer();
+    while (seen != 0xFFFFFFu) {
+        for (NvU32 w = 0; w < 24; w++) {
+            if ((seen >> w) & 1u) continue;
+            if (reinterpret_cast<const volatile NvU32 *>(return_slots[w])[0] == sequence) {
+                seen |= 1u << w; last = w;
+                if (!t_data && (seen & data_mask) == data_mask) t_data = q38_globaltimer();
+            }
+        }
+        if (q38_globaltimer() - t0 > deadline_ns) return;      // the normal wait reports the failure
+    }
+    const unsigned long long t_all = q38_globaltimer();
+    if (!t_data) t_data = t_all;
+    PciClusterTimingRec *r = pc_rec(d);
+    if (r) { const unsigned long long lag = t_all - t_data; r->pad = NvU32(lag > 0xFFFFFFull ? 0xFFFFFFull : lag) | (last << 24); }
+}
 template <class Op>
 __global__ static void pci_cluster_wait_combine(const PeerState::GpuDev *d, PeerState::GpuHost *hst, typename Op::Args a,
         const NvU64 *return_slots, NvU32 workers, NvU32 layer, NvU32 *observed_headers,
@@ -928,6 +1080,7 @@ __global__ static void pci_cluster_wait_combine(const PeerState::GpuDev *d, Peer
     __shared__ NvU32 ok, skip;
     if (threadIdx.x == 0) {
         skip = static_cast<const volatile PeerState::GpuDev *>(d)->cur_skip; ok = 0;
+        if (!skip && g_q38_ack_profile) pci_cluster_ack_profile(d, return_slots, workers, deadline_ns);
         if (!skip) ok = pci_cluster_wait(d, hst, return_slots, workers, layer, observed_headers, timeout_cycles, deadline_ns);
         PciClusterTimingRec *r = pc_rec(d); if (r) r->t_ack = q38_globaltimer();
     }
@@ -1832,6 +1985,26 @@ static void peer_open(const char *rtx_bdf,const char *maps_path,const char *uuid
             static_assert(Q38_MR_PEER_BASE(1)+Q38_MR_PEER_BLOCK_BYTES<=Q38_DIRECT_RESULT_OFF,"peer block 1 overlaps the direct record");
             static_assert(Q38_MR_BLOCK_OFF>=kAggBlockOff+32&&Q38_MR_BLOCK_OFF+sizeof(Q38MrBlock)<=kAggBlockOff+PAGE,"multi-row block overlaps the aggregation block");
             const NvU32 step=NvU32(Q38_MR_RECORD_SHIFT), back_step=NvU32(0u-Q38_MR_RECORD_SHIFT);
+            // Q38_RTX_PEER_MR_STREAM (default on; 0 = off, 2026-11-04): streamed finish with per-block flags (resident_multirow_abi.cuh)
+            const char *st_env=std::getenv("Q38_RTX_PEER_MR_STREAM");
+            // default on since the PoC (T256/T257: 141.3 -> 133.1 us per layer for 1 row, 400.4 -> 379.9 for 4, bit-identical)
+            const NvU32 stream_bit=(st_env&&std::strcmp(st_env,"0")==0)?0u:Q38_MR_FLAG_STREAM;
+            // Q38_RTX_PEER_MR_DIAG_NORTX=1 (diagnostic only, results wrong): reducers skip their result writes to the RTX
+            const char *dg_env=std::getenv("Q38_RTX_PEER_MR_DIAG_NORTX");
+            const NvU32 diag_bit=(dg_env&&std::strcmp(dg_env,"1")==0)?Q38_MR_FLAG_DIAG_NORTX:0u;
+            if(diag_bit)std::fprintf(stderr,"RTX_PEER_MR_DIAG_NORTX,1,results_invalid\n");
+            // Q38_RTX_PEER_MR_PROFILE=1: card leaders record their finish phases (resident_multirow_abi.cuh)
+            const char *pf_env=std::getenv("Q38_RTX_PEER_MR_PROFILE");
+            const NvU32 prof_bit=(pf_env&&std::strcmp(pf_env,"1")==0)?Q38_MR_FLAG_PROFILE:0u;
+            if(prof_bit)std::fprintf(stderr,"RTX_PEER_MR_PROFILE,1\n");
+            // Q38_RTX_PEER_MR_LL=1 (PoC, kernels built with -DQ38_MR_LL_BUILD): LL peer push for 1-row exchanges; the LL row
+            // lives in the rows->=1 peer blocks, so their push routes must map at least Q38_MR_LL_BYTES
+            const char *ll_env=std::getenv("Q38_RTX_PEER_MR_LL");
+            const NvU32 ll_bit=(ll_env&&std::strcmp(ll_env,"1")==0)?Q38_MR_FLAG_LL:0u;
+            if(ll_bit&&(!stream_bit||NvU64(push_pages)*PAGE<Q38_MR_LL_BYTES))
+                throw std::runtime_error("Q38_RTX_PEER_MR_LL needs the streamed finish and push routes of >= 20480 B (Q38_RTX_PEER_MOE_MULTIROW_MAX=4)");
+            if(ll_bit)std::fprintf(stderr,"RTX_PEER_MR_LL,1,push_bytes,%llu\n",(unsigned long long)push_pages*PAGE);
+            static_assert(Q38_MR_BLOCK_FLAG_OFF>=Q38_CPU_MAILBOX_HIDDEN*4+8&&Q38_MR_BLOCK_FLAG_OFF+4*Q38_MR_MAX_BLOCKS<=3*PAGE,"block flags outside the row-0 window");
             auto back=[&](size_t w){return w==23||(w==22&&N>=3);};
             auto ret1_va=[&](size_t w){return back(w)?s->workers[w].return_alias_va-Q38_MR_RECORD_SHIFT:s->workers[w].return_alias_va+Q38_MR_RECORD_SHIFT;};
             auto put_mr=[&](size_t w,const Q38MrBlock &b,const char*what){NvU32 v[8];std::memcpy(v,&b,sizeof(v));put(save(w,Q38_MR_BLOCK_OFF),v,what,w);};
@@ -1849,22 +2022,24 @@ static void peer_open(const char *rtx_bdf,const char *maps_path,const char *uuid
                         win,winlen,push_pages,&pdb,PAGE,true,use_owner_bus_address);
                     if(rt.owner_offset!=base)
                         throw std::runtime_error("multi-row peer block landed at an unexpected leader offset for "+peer.bdf);
-                    put_mr(P,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_PEER|(N<<8),0u,0u,0ull,push1_va},"multi-row peer block");
+                    put_mr(P,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_PEER|(N<<8),stream_bit|ll_bit,0u,0ull,push1_va},"multi-row peer block");
+                    for(NvU64 o=0;o<4*Q38_MR_MAX_BLOCKS;o+=32){const NvU32 z[8]={0,0,0,0,0,0,0,0};
+                        put(save(L,kAggSlotOff+NvU64(pi-1)*kAggSlotStride+Q38_MR_BLOCK_FLAG_OFF+o),z,"multi-row block flags",L);}
                     mr_routes++;
                     std::fprintf(stderr,"RTX_PEER_MR_ROUTE,card,%d,peer,%s,leader,%s,push1_va,0x%llx,leader_bus,0x%llx,pages,%u,leaf_bytes,4096\n",
                         c,peer.bdf.c_str(),leader.bdf.c_str(),(unsigned long long)push1_va,(unsigned long long)(leader.bar_bus+rt.owner_offset),push_pages);
                     for(NvU32 r=1;r<N;r++){const NvU32 z[8]={0,0,0,0,0,0,0,0};
                         put(save(L,base+NvU64(r-1)*Q38_MR_PUSH_ROW_BYTES+Q38_CPU_MAILBOX_HIDDEN*4),z,"multi-row leader flag",L);}
                 }
-                put_mr(L,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_LEADER|(N<<8),1u,back(L)?back_step:step,ret1_va(L),0ull},"multi-row leader block");
+                put_mr(L,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_LEADER|(N<<8),1u|stream_bit|diag_bit|prof_bit|ll_bit,back(L)?back_step:step,ret1_va(L),0ull},"multi-row leader block");
             }
-            for(size_t w=20;w<24;w++)put_mr(w,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_SHARED|(N<<8),1u,back(w)?back_step:step,ret1_va(w),0ull},"multi-row shared block");
+            for(size_t w=20;w<24;w++)put_mr(w,Q38MrBlock{Q38_MR_MAGIC,Q38_MR_ROLE_SHARED|(N<<8),1u|diag_bit,back(w)?back_step:step,ret1_va(w),0ull},"multi-row shared block");
             for(size_t w=0;w<24;w++){const bool red=(w<20&&w%4==0)||w>=20;
                 for(NvU32 r=1;r<N;r++)if(red!=(s->return_slots1[size_t(r-1)*24+w]!=0))throw std::runtime_error("multi-row return records do not match the reducer set");}
             CK(cudaMalloc(&s->device_return_slots1,s->return_slots1.size()*sizeof(NvU64)));
             CK(cudaMemcpy(s->device_return_slots1,s->return_slots1.data(),s->return_slots1.size()*sizeof(NvU64),cudaMemcpyHostToDevice));
-            std::fprintf(stderr,"RTX_PEER_MR_READY,max_rows,%u,row_peer_routes,%zu,push_pages,%u,reducer_records,%u,routes_total,%zu\n",
-                         N,mr_routes,push_pages,9*N,s->agg_routes.size()+24);
+            std::fprintf(stderr,"RTX_PEER_MR_READY,max_rows,%u,row_peer_routes,%zu,push_pages,%u,reducer_records,%u,routes_total,%zu,stream,%u\n",
+                         N,mr_routes,push_pages,9*N,s->agg_routes.size()+24,stream_bit?1u:0u);
         }
     }
 #endif
@@ -2232,12 +2407,27 @@ extern "C" int q38_rtx_peer_moe2_gpu(uint32_t layer,const void*h,int h_type,cons
         s.in_flight=true; s.pex_quiesced=false; s.m10_quiesced=false; s.gpu_used=true;
         using Op=PciClusterMoe2Op;
         const Op::Args a{h,ids,routes,out,rows,s.device_return_slots1,s.gpu_dev,s.gpu_host_dev,layer};
+        if (s.publish_order == 4 && s.pub_groups == 1) {      // default: begin + publish + go in one kernel (outer group)
+            pci_cluster_begin_publish_go<Op><<<1,256,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.pub_aliases,layer);
+            CK(cudaGetLastError());
+        } else {
         pci_cluster_begin<Op><<<1,32,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,layer);
         CK(cudaGetLastError());
+        if (s.publish_order == 3 && s.pub_groups == 1) {     // needs the outer group; else the default path below
+            pci_cluster_publish<Op><<<s.pub_groups,256,0,st>>>(s.gpu_dev,a,s.pub_aliases,layer);
+            CK(cudaGetLastError());
+            pci_cluster_go_staggered<<<1,1,0,st>>>(s.gpu_dev,s.device_pex_aliases,Op::kMode,s.publish_seq,s.go_gap_ns,s.go_lowfence);
+            CK(cudaGetLastError());
+        } else if ((s.publish_order == 1 || s.publish_order == 2) && s.pub_groups == kPexGroups) {
+            pci_cluster_publish_go<Op><<<s.publish_order == 2 ? 1 : kPexGroups,256,0,st>>>(s.gpu_dev,a,s.pub_aliases,layer,s.publish_order == 2 ? 1u : 0u,s.publish_seq);
+            CK(cudaGetLastError());
+        } else {
         pci_cluster_publish<Op><<<s.pub_groups,256,0,st>>>(s.gpu_dev,a,s.pub_aliases,layer);
         CK(cudaGetLastError());
         pci_cluster_publish_sequence<<<s.pub_groups,1,0,st>>>(s.gpu_dev,s.pub_aliases,Op::kMode);
         CK(cudaGetLastError());
+        }
+        }   // publish order 4 else
         pci_cluster_wait_combine<Op><<<1,kMoeCombineThreads,0,st>>>(s.gpu_dev,s.gpu_host_dev,a,s.device_return_slots,24,layer,
                                                      s.device_headers,kWaitCycles,2000000000ull);
         CK(cudaGetLastError());

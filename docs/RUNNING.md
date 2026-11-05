@@ -85,7 +85,7 @@ Edit the worker headers, then:
 pueue add --group gpu --label reload -- sudo -n bash src/run_pci_cluster_kernel_reload.sh
 ```
 
-It parks the workers, builds new cubins and sends `RELOAD_KERNELS`. It refuses while any client is active. The workers stop their resident grids, load the new images into their existing contexts and restart, keeping all weights. The daemon records the image hashes and a reload generation. Changes to the service binaries or to the shared mailbox layout still need a daemon restart:
+It parks the workers, builds new cubins and sends `RELOAD_KERNELS`. It refuses while any client is active. `Q38_RELOAD_NVCC_FLAGS` adds nvcc flags for a measurement build (for example `-DQ38_MR_PROFILE_BUILD` or `-DQ38_MR_LL_BUILD`); reload again without it to get the default kernels back, and compare the routed image hash the script prints. The workers stop their resident grids, load the new images into their existing contexts and restart, keeping all weights. The daemon records the image hashes and a reload generation. Changes to the service binaries or to the shared mailbox layout still need a daemon restart:
 
 ```bash
 pueue add --group gpu --label restart -- sudo -n bash src/run_qwen38_daemon_restart.sh
@@ -98,6 +98,8 @@ The restart sends `STOP`, waits for the daemon to exit by itself (it never kills
 | Symptom | What to do |
 |---|---|
 | Client crashed, daemon shows a registered peer client | `qwen38_resident_daemon.py recover-peer-client --control-socket …`: restores the journaled routes and worker words of that client |
+| The wrapper prints `PRESERVE,… ACS remains temporary` | Cleanup was not proven, so ACS and `rtx_mc_dma_map` were left as they were. Once no client runs and no worker can send (client dead, workers parked or stopped): `rmmod rtx_mc_dma_map`, then write back every port's original ACS control from the trial's `acs-controls.tsv` (check identity and the saved temporary value first, read back each write) |
+| Daemon in `ERROR_CLEANUP`, a service does not exit after `STOP` | The daemon never kills its services. Go in this order: orderly stop / park, `recover-peer-client`, then `SIGTERM` (then `SIGKILL`) to the stuck service by its exact pid (`ps -o pid,ppid,args`; never `pgrep -f`, which also matches the daemon), and a reboot only last. A killed service does not restore its card's multicast group: restore groups 0–5 with `pex_group_config.py restore --snapshot <daemon run>/daemon-pex-snapshots/<…>/groupN` (exact readback), then start a new daemon |
 | Route records left by a dead process | `qwen38_resident_daemon.py list-route-records` shows them. With the lifecycle patch, UVM frees a record when its VA space is destroyed. The `REAP_DEAD` ioctl frees records of already-dead VA spaces; this tree has no command-line tool for it |
 | Worker exit with a reason code | the RTX reports it (sticky error and reason). Codes: [INTERFACE.md](INTERFACE.md) |
 | `UVM reloaded since the recorded swap` | the module was reloaded (or the machine rebooted): swap again, update `Q38_UVM_LAST_LOAD`, restart the daemon |

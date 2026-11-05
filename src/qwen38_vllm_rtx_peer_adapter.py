@@ -247,6 +247,9 @@ class RtxPeerResidentM10MoEAdapter:
         # Q38_RTX_PEER_MOE_MULTIROW_MAX (2..4, default 2): the most rows one exchange takes (the library sizes its
         # return / card-sum routes for it at open); calls of 2..max rows go as one mode-10 exchange.
         self.moe_multirow_max = int(os.environ.get("Q38_RTX_PEER_MOE_MULTIROW_MAX", "2") or 2) if self.moe_multirow else 0
+        # Q38_RTX_PEER_MOE_MULTIROW_MIN (1 or 2, default 1): 1 also sends single-row calls (plain decode) through mode 10,
+        # whose streamed finish is faster than mode 1 (T257: 133.1 vs 141.3 us per layer; bit-identical)
+        self.moe_multirow_min = int(os.environ.get("Q38_RTX_PEER_MOE_MULTIROW_MIN", "1") or 1)
         self.moe_multirow_calls = 0
         self.lib.q38_rtx_peer_moe2_gpu.argtypes = list(self.lib.q38_rtx_peer_moe_batch_gpu.argtypes)
         self.lib.q38_rtx_peer_moe2_gpu.restype = ctypes.c_int
@@ -544,7 +547,7 @@ class RtxPeerResidentM10MoEAdapter:
                 tensor.record_stream(stream_obj)
         h_type = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[hidden.dtype]
         error = ctypes.create_string_buffer(1024)
-        multi = self.moe_multirow and 2 <= rows <= self.moe_multirow_max and h_type == 2
+        multi = self.moe_multirow and self.moe_multirow_min <= rows <= self.moe_multirow_max and h_type == 2
         batch = not multi and self.moe_batch and rows >= self.moe_batch_min_rows
         if multi:
             rc = self.lib.q38_rtx_peer_moe2_gpu(
@@ -719,7 +722,7 @@ class RtxPeerResidentM10MoEAdapter:
         n = ctypes.c_uint32(0); error = ctypes.create_string_buffer(512)
         if self.lib.q38_rtx_peer_timing_read(ctypes.c_void_p(buf.ctypes.data), int(max_records), ctypes.byref(n), error, len(error)):
             raise RuntimeError(f"timing read: {error.value.decode(errors='replace')}")
-        return [{k: int(r[k]) for k in dt.names if k != "pad"} for r in buf[: n.value]]
+        return [{k: int(r[k]) for k in dt.names} for r in buf[: n.value]]   # pad: ack profile (Q38_RTX_PEER_ACK_PROFILE)
 
     def worker_timing_enable(self) -> None:
         """M10-side MoE stamps (pci_cluster_exchange.cuh ring); needs the row-gather configuration."""

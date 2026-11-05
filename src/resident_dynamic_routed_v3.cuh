@@ -238,6 +238,35 @@ __device__ __noinline__ void q38_mr_down_rows(const DeviceWeights lw, const Q38M
 
 // Mode 10 body (all threads of the grid, after the request checks passed). Returns false after an error exit
 // (reported to the RTX slot like the other modes); gen is the kernel's grid-barrier generation.
+// Leader-finish profile (Q38_MR_FLAG_PROFILE, 2026-11-04): the mode-10 leader finish loop for one element per thread,
+// split into phases with a block barrier between them; same sums in the same order. Only in a profile build
+// (-DQ38_MR_PROFILE_BUILD): any extra code here changes the main kernel's register allocation (24 B frame,
+// 28/40 B spill -> 40-48 B / 60/92 B), so the default build compiles without it. Returns the packed phases for
+// block 0 thread 0 (0 elsewhere).
+#ifdef Q38_MR_PROFILE_BUILD
+__device__ __noinline__ unsigned long long q38_mr_leader_prof(const Q38MrRows &m, unsigned R, unsigned np, const char *sl0, unsigned st0,
+    const char *cb, ResidentDirectResult *direct, Q38CpuMailboxSlot *cpu_slot, unsigned long long ret1, int step, bool diag_nortx,
+    unsigned long long t_fl) {
+ const int i=blockIdx.x*blockDim.x+threadIdx.x; float v[Q38_MR_MAX_ROWS];
+ {float v0=m.out(0)[i];for(unsigned k=0;k<np;k++)v0+=reinterpret_cast<const volatile float*>(sl0+k*st0)[i];v[0]=v0;}
+ #pragma unroll
+ for(unsigned r=1;r<Q38_MR_MAX_ROWS;r++)if(r<R){float vr=m.out(r)[i];
+  for(unsigned k=0;k<np;k++)vr+=reinterpret_cast<const volatile float*>(cb+Q38_MR_PEER_BASE(k)+(r-1)*Q38_MR_PUSH_ROW_BYTES)[i];v[r]=vr;}
+ __syncthreads(); unsigned long long ta=0,tb=0,tc=0,td=0; if(!blockIdx.x&&!threadIdx.x)ta=pci_cluster_gtimer();
+ direct->result[i]=v[0];
+ __syncthreads(); if(!blockIdx.x&&!threadIdx.x)tb=pci_cluster_gtimer();
+ if(!diag_nortx){cpu_slot->result[i]=v[0];
+  #pragma unroll
+  for(unsigned r=1;r<Q38_MR_MAX_ROWS;r++)if(r<R)reinterpret_cast<Q38CpuMailboxSlot*>(ret1+(long long)(r-1)*step)->result[i]=v[r];}
+ __syncthreads(); if(!blockIdx.x&&!threadIdx.x)tc=pci_cluster_gtimer();
+ __threadfence_system();
+ __syncthreads();
+ if(blockIdx.x||threadIdx.x)return 0ull;
+ td=pci_cluster_gtimer();
+ auto q=[](unsigned long long x){return min(x/32ull,0x3FFFull);};
+ return (Q38_MR_PROF_MAGIC<<56)|(q(ta-t_fl)<<42)|(q(tb-ta)<<28)|(q(tc-tb)<<14)|q(td-tc);
+}
+#endif
 __device__ __noinline__ bool q38_mr_routed(const DeviceWeights* layers, ResidentDynamicControl* control, ResidentDynamicGrid* grid,
     float* activation, float* result_local, ResidentDynamicReturn* output, ResidentDirectResult* direct, unsigned seq, unsigned layer,
     unsigned &gen, unsigned long long t_seen, unsigned long long t_chk) {
@@ -270,39 +299,107 @@ __device__ __noinline__ bool q38_mr_routed(const DeviceWeights* layers, Resident
     if(R==2)q38_mr_down2(lw,m.ids(0),m.ids(1),m.rt(0),m.rt(1),acts,m.out(0),m.out(1));
     else q38_mr_down_rows(lw,m,R,acts);}
    else dynamic_down_layer(Params{lw,control->x,m.rt(0),m.ids(0),m.act(0),m.out(0)});
-   if(!dynamic_grid_barrier(grid,++gen)) Q38_MR_FAIL
-   if(!blockIdx.x&&!threadIdx.x)t_dn=pci_cluster_gtimer();
    const volatile Q38AggBlock *ag=reinterpret_cast<const volatile Q38AggBlock*>(cb+Q38_AGG_OFF);
    const volatile Q38MrBlock *mb=reinterpret_cast<const volatile Q38MrBlock*>(cb+Q38_MR_BLOCK_OFF);
    const unsigned arole=ag->role, np=arole==1u?ag->n_peers:0u;   // validated: role 1 or 2 with matching MR block
+   // streamed finish: every thread pushes / sums only the elements it computed in down (same mapping), so no grid
+   // barrier is needed here; per-block flags replace the per-row flags
+   const bool stream=(mb->slot1_off&Q38_MR_FLAG_STREAM)!=0u&&gridDim.x<=Q38_MR_MAX_BLOCKS;
+   const bool diag_nortx=(mb->slot1_off&Q38_MR_FLAG_DIAG_NORTX)!=0u;     // diagnostic: no result writes to the RTX
+#ifdef Q38_MR_LL_BUILD
+   const bool ll=stream&&(mb->slot1_off&Q38_MR_FLAG_LL)!=0u, ll1=ll&&R==1u;   // LL peer push PoC (resident_multirow_abi.cuh)
+#endif
+#ifdef Q38_MR_PROFILE_BUILD
+   const bool prof=(mb->slot1_off&Q38_MR_FLAG_PROFILE)!=0u&&arole==1u&&gridDim.x*blockDim.x==unsigned(H)&&R<=Q38_MR_MAX_ROWS;
+   unsigned long long t_prof=0;                                         // packed leader-finish phases (block 0 thread 0)
+#endif
+   if(stream)__syncthreads();
+   else if(!dynamic_grid_barrier(grid,++gen)) Q38_MR_FAIL
+   if(!blockIdx.x&&!threadIdx.x)t_dn=pci_cluster_gtimer();
    const char *sl0=cb+ag->slot_offset; const unsigned st0=ag->slot_stride;
    const int step=static_cast<int>(mb->slot1_stride);              // reducer record step (+/- 0x3000)
    auto *cpu_slot=reinterpret_cast<Q38CpuMailboxSlot*>(control->cpu_mailbox_device_ptr);
    const unsigned long long ret1=mb->ret1_va;
    volatile float *push0=arole==2u?reinterpret_cast<volatile float*>(ag->push_va):nullptr;
    char *push1=arole==2u?reinterpret_cast<char*>(mb->push1_va):nullptr;
-   if(arole==1u){
+   unsigned long long t_fl=0,t_sm=0;
+#ifdef Q38_MR_LL_BUILD
+   if(ll1){}                         // LL: no flags; each leader thread polls its own elements below
+   else
+#endif
+   if(stream&&arole==1u){            // wait for this block's flag of every peer (one flag covers all R rows)
+    if(!threadIdx.x){const unsigned long long t0=clock64();
+     for(unsigned k=0;k<np;k++){auto *f=reinterpret_cast<const volatile unsigned*>(sl0+k*st0+Q38_MR_BLOCK_FLAG_OFF)+blockIdx.x;
+      while(*f!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}}
+     if(!blockIdx.x)t_fl=pci_cluster_gtimer();}
+    __syncthreads();__threadfence();
+   } else if(arole==1u){
     if(!threadIdx.x){const unsigned long long t0=clock64();
      for(unsigned k=0;k<np;k++){
       auto *f0=reinterpret_cast<const volatile unsigned*>(sl0+k*st0+H*4u);
       while(*f0!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}
       for(unsigned r=1;r<R;r++){auto *f=reinterpret_cast<const volatile unsigned*>(cb+Q38_MR_PEER_BASE(k)+(r-1)*Q38_MR_PUSH_ROW_BYTES+H*4u);
-       while(*f!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}}}}
+       while(*f!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}}}
+     if(!blockIdx.x)t_fl=pci_cluster_gtimer();}
     __syncthreads();__threadfence();
    }
+#ifdef Q38_MR_PROFILE_BUILD
+   if(prof)t_prof=q38_mr_leader_prof(m,R,np,sl0,st0,cb,direct,cpu_slot,ret1,step,diag_nortx,t_fl);   // non-inlined
+   else
+#endif
+#ifdef Q38_MR_LL_BUILD
+   if(ll1){
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<H;i+=gridDim.x*blockDim.x) {
+     float v0=m.out(0)[i];
+     if(arole==1u)for(unsigned k=0;k<np;k++){   // peer k's {value, seq} for element i, in the fixed order
+      auto *p=reinterpret_cast<volatile unsigned long long*>(const_cast<char*>(cb)+Q38_MR_PEER_BASE(k))+i;
+      unsigned long long w=*p; const unsigned long long t0=clock64();
+      while(unsigned(w>>32)!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}w=*p;}
+      v0+=__uint_as_float(unsigned(w)); *p=0ull;}
+     direct->result[i]=v0;
+     if(arole==2u)reinterpret_cast<volatile unsigned long long*>(push1)[i]=(static_cast<unsigned long long>(seq)<<32)|__float_as_uint(v0);
+     else if(!diag_nortx)cpu_slot->result[i]=v0;
+    }
+    if(arole==1u&&!blockIdx.x&&!threadIdx.x)t_fl=pci_cluster_gtimer();   // LL: block 0 thread 0's peer data seen + summed
+    if(arole!=2u)__threadfence_system();   // results to the RTX and the slot clears before the ack (peers: nothing to order)
+   } else
+#endif
+   {
    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<H;i+=gridDim.x*blockDim.x) {
     float v0=m.out(0)[i];
     if(arole==1u)for(unsigned k=0;k<np;k++)v0+=reinterpret_cast<const volatile float*>(sl0+k*st0)[i];
     direct->result[i]=v0;
-    if(arole==2u)push0[i]=v0; else cpu_slot->result[i]=v0;
+    if(arole==2u)push0[i]=v0; else if(!diag_nortx)cpu_slot->result[i]=v0;
     for(unsigned r=1;r<R;r++){float v=m.out(r)[i];
      if(arole==1u)for(unsigned k=0;k<np;k++)v+=reinterpret_cast<const volatile float*>(cb+Q38_MR_PEER_BASE(k)+(r-1)*Q38_MR_PUSH_ROW_BYTES)[i];
      if(arole==2u)reinterpret_cast<volatile float*>(push1+(r-1)*Q38_MR_PUSH_ROW_BYTES)[i]=v;
-     else reinterpret_cast<Q38CpuMailboxSlot*>(ret1+(long long)(r-1)*step)->result[i]=v;}
+     else if(!diag_nortx)reinterpret_cast<Q38CpuMailboxSlot*>(ret1+(long long)(r-1)*step)->result[i]=v;}
    }
-   __threadfence_system(); if(!dynamic_grid_barrier(grid,++gen)) Q38_MR_FAIL
+   __threadfence_system();
+   }
+#ifdef Q38_MR_LL_BUILD
+   if(!ll1)
+#endif
+   if(stream&&arole==2u){__syncthreads();   // all of this block's elements (every row) are written: one flag
+    if(!threadIdx.x){reinterpret_cast<volatile unsigned*>(reinterpret_cast<volatile char*>(push0)+Q38_MR_BLOCK_FLAG_OFF)[blockIdx.x]=seq;__threadfence_system();}}
+   if(!blockIdx.x&&!threadIdx.x)t_sm=pci_cluster_gtimer(); if(!dynamic_grid_barrier(grid,++gen)) Q38_MR_FAIL
+#ifdef Q38_MR_LL_BUILD
+   if(ll&&!ll1&&arole==1u){   // LL mode after an R >= 2 exchange: clear the LL area of every peer block before the ack
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<H;i+=gridDim.x*blockDim.x)
+     for(unsigned k=0;k<np;k++)reinterpret_cast<volatile unsigned long long*>(const_cast<char*>(cb)+Q38_MR_PEER_BASE(k))[i]=0ull;
+    __threadfence_system();
+    if(!dynamic_grid_barrier(grid,++gen)) Q38_MR_FAIL
+   }
+#endif
    if(!blockIdx.x&&!threadIdx.x){
-    pci_cluster_wtiming_write(control,seq,layer,arole,7u,t_seen,t_chk,t_gu,t_dn,R);
+    pci_cluster_wtiming_write(control,seq,layer,arole,7u,t_seen,
+#ifdef Q38_MR_PROFILE_BUILD
+      t_prof?t_prof:t_chk,
+#else
+      t_chk,
+#endif
+      t_gu,t_dn,
+      ((t_fl?min(t_fl-t_dn,0xFFFFFFFFull):0ull)<<32)|min(t_sm-t_dn,0xFFFFFFFFull));
     output->status=0;direct->status=0;
     if(arole==2u){for(unsigned r=R-1;r>=1;r--)reinterpret_cast<volatile float*>(push1+(r-1)*Q38_MR_PUSH_ROW_BYTES)[H]=__uint_as_float(seq);
      push0[H]=__uint_as_float(seq);}
@@ -511,10 +608,13 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_routed(con
   const unsigned q38_role=(q38_agg->magic==Q38_AGG_MAGIC)?q38_agg->role:0u;
   const unsigned q38_np=q38_agg->n_peers,q38_off=q38_agg->slot_offset,q38_stride=q38_agg->slot_stride;
   volatile float *q38_push=q38_role==2u?reinterpret_cast<volatile float*>(q38_agg->push_va):nullptr;
+  // finish timing (2026-11-04, worker timing only): block 0's "all peer flags seen" and "own sum / push written"
+  unsigned long long q38_t_fl=0,q38_t_sm=0;
   if(q38_role==1u){
    if(!threadIdx.x){const unsigned long long t0=clock64();
     for(unsigned k=0;k<q38_np;k++){auto *f=reinterpret_cast<const volatile unsigned*>(reinterpret_cast<const char*>(control)+q38_off+k*q38_stride+H*4u);
-     while(*f!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}}}
+     while(*f!=seq){if(clock64()-t0>Q38_AGG_DEADLINE){atomicOr(&grid->error,64u);break;}}}
+    if(!blockIdx.x)q38_t_fl=pci_cluster_gtimer();}
    __syncthreads();__threadfence();
   }
   for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<H;i+=gridDim.x*blockDim.x) {
@@ -524,8 +624,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) resident_dynamic_routed(con
    if(!q38_rtx_return)output->result[i]=value; direct->result[i]=value;
    if(cpu_slot)cpu_slot->result[i]=value;
   }
-  __threadfence_system(); if(!dynamic_grid_barrier(grid,++gen)) return;
-  if(!blockIdx.x&&!threadIdx.x) pci_cluster_wtiming_write(control,seq,layer,q38_role,1u,q38_t_seen,q38_t_chk,q38_t_gu,q38_t_dn);
+  __threadfence_system(); if(!blockIdx.x&&!threadIdx.x)q38_t_sm=pci_cluster_gtimer(); if(!dynamic_grid_barrier(grid,++gen)) return;
+  // t_extra: high 32 = flags seen - t_down (leader), low 32 = own sum / push written - t_down (ns)
+  if(!blockIdx.x&&!threadIdx.x) pci_cluster_wtiming_write(control,seq,layer,q38_role,1u,q38_t_seen,q38_t_chk,q38_t_gu,q38_t_dn,
+    ((q38_t_fl?min(q38_t_fl-q38_t_dn,0xFFFFFFFFull):0ull)<<32)|min(q38_t_sm-q38_t_dn,0xFFFFFFFFull));
   if(!blockIdx.x&&!threadIdx.x) { output->status=0;direct->status=0;if(cpu_slot){cpu_slot->worker=(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)?0:control->cpu_mailbox_worker;cpu_slot->layer=(control->cpu_mailbox_reserved&Q38_CPU_MAILBOX_FLAG_RTX_BAR1_RETURN)?1:layer;cpu_slot->status=0;}if(q38_role==2u)q38_push[H]=__uint_as_float(seq);__threadfence_system();if(cpu_slot)cpu_slot->seq=seq;output->seq=seq;direct->seq=seq; }
   last=seq;
  }

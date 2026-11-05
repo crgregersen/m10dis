@@ -85,6 +85,7 @@ __device__ __noinline__ bool q38_mr_shared(const Weights* layers,SharedResidentC
    const volatile Q38MrBlock *mb=reinterpret_cast<const volatile Q38MrBlock*>(cb+Q38_MR_BLOCK_OFF);
    const unsigned long long ret1=mb->ret1_va; const int step=static_cast<int>(mb->slot1_stride);
    auto rec=[&](unsigned r){return reinterpret_cast<Q38CpuMailboxSlot*>(ret1+(long long)(r-1)*step);};
+   const bool diag_nortx=(mb->slot1_off&Q38_MR_FLAG_DIAG_NORTX)!=0u;     // diagnostic: no result writes to the RTX
    // hidden rows into shared memory: row 0 in q38_hs (S floats), rows >= 1 in q38_xs (x is no longer needed)
    {volatile float* hp=hid(0);for(int i=threadIdx.x;i<S;i+=blockDim.x)q38_hs[i]=hp[i];}
    for(unsigned r=1;r<R;r++){volatile float* hp=hid(r);for(int i=threadIdx.x;i<S;i+=blockDim.x)q38_xs[(r-1)*S+i]=hp[i];}
@@ -93,10 +94,10 @@ __device__ __noinline__ bool q38_mr_shared(const Weights* layers,SharedResidentC
     const int row=base+lane;
     if(R<=2){float m0,m1;
      if(R>1)q38_shared_v2_down_chunk2(w.d,q38_hs,q38_xs,base,lane,S,m0,m1);else{m0=q38_shared_v2_down_chunk(w.d,q38_hs,base,lane,S);m1=0.0f;}
-     direct->result[row]=m0;cpu_slot->result[row]=m0;if(R>1)rec(1)->result[row]=m1;}
+     direct->result[row]=m0;if(!diag_nortx){cpu_slot->result[row]=m0;if(R>1)rec(1)->result[row]=m1;}}
     else{float m0=q38_shared_v2_down_chunk(w.d,q38_hs,base,lane,S);float mr[4];
      if(R==3)q38_shared_down_chunkN<2>(w.d,q38_xs,base,lane,S,mr);else q38_shared_down_chunkN<3>(w.d,q38_xs,base,lane,S,mr);
-     direct->result[row]=m0;cpu_slot->result[row]=m0;for(unsigned r=1;r<R;r++)rec(r)->result[row]=mr[r-1];}
+     direct->result[row]=m0;if(!diag_nortx){cpu_slot->result[row]=m0;for(unsigned r=1;r<R;r++)rec(r)->result[row]=mr[r-1];}}
    }
    if(worker==0&&!blockIdx.x&&!threadIdx.x)direct->gate=output->gate;
    __threadfence_system();if(!shared_resident_barrier(grid,++gen)) Q38_MR_SFAIL

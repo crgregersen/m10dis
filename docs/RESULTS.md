@@ -39,6 +39,17 @@ All numbers come from runs on the test machine (2026-11-02 to 2026-11-04). Every
 | 2 | 65.4 (70 / 66 % per position); 68.0 with the outer group | 82.6 (97 / 97 %) |
 | 3 | 60.1 (67 / 67 / 56 %) | **89.6** (97 / 99 / 96 %); **93.7** with the outer group |
 
+With the streamed card-sum finish (default since 2026-11-04; per-block flags, no barrier between down and finish; exchange 141.3 → 133.1 µs per layer for 1 row, 400.4 → 379.9 µs for 4; runs `stream_poc_off` / `stream_poc_on`): **55.7** (0 drafts), **69.5** (1), **69.8** (2) tok/s on the natural prompt and **95.8** (3, humaneval), runs `stream_final_*`.
+
+With begin, publish and go in one RTX kernel (default since 2026-11-05, `Q38_RTX_PEER_PUBLISH_ORDER=4`; exchange 133.1 → 128.0 µs per layer for 1 row, 204.8 → 200.7 for 2, 380.9 → 374.8 for 4, runs `pubgo_ref` / `pubgo_merge`), mean of four alternating pairs on the natural prompt (runs `pubgo_tps_*`; identical tokens in all runs):
+
+| Drafts | Three kernels | One kernel | Δ |
+|---|---|---|---|
+| 0 | 55.63 (sd 0.35) | **56.10** (sd 0.27) | +0.8 % |
+| 2 | 69.75 (sd 0.13) | **69.84** (sd 0.66) | +0.1 % |
+
+The harness saving (4–6 µs per layer) shrinks inside vLLM's CUDA graph, where kernel boundaries are already cheap.
+
 The outer group (`Q38_RTX_PEER_PEX_OUTER=1`, [TRANSPORT.md](TRANSPORT.md#8-optional-one-outer-multicast-group-q38_rtx_peer_pex_outer1)) publishes each request once instead of six times: 16.4 → 7.2 µs per MoE layer for one row, 45.1 → 11.3 µs for four, with identical results.
 
 The humaneval column overstates acceptance: with `ignore_eos` the model keeps going after its answer, and that continuation repeats. The best draft length is lower than on a single GPU, because every verify row costs M10 time: one multi-row exchange takes 150 / 239 / 337 / 432 µs per layer for 1 / 2 / 3 / 4 rows (bandwidth-bound: each row reads its own experts). Suggested: 2 draft tokens by default, 3 for code-heavy work. The MTP layer's attention KV costs about 21 % of the KV pool (66,628 instead of 84,440 tokens at 2.5 GiB).
@@ -47,16 +58,31 @@ What did not help: unrolling the gate/up lane loop (gate/up 62 → 81 µs for 2 
 
 ## Where the time goes in one MoE layer
 
-### Decode (1 token, mode 1)
+### Decode (1 token, mode 10, defaults of 2026-11-05)
 
-| Step | Time |
+| Step | Time | Run |
+|---|---|---|
+| RTX begin + publish + go (one kernel, outer multicast) | 4.1 µs | `pubgo_merge` |
+| Wait for the 24 worker headers (M10 round trip) | 117.8 µs | `pubgo_merge` |
+| RTX combine (9 result rows) | 6.1 µs | `pubgo_merge` |
+| **Whole layer** | **128.0 µs** (+ 5.1 µs to the next layer) | `pubgo_merge` |
+
+Inside the round trip, the slowest worker is a card leader (critical path 91.1 µs, worker clocks, runs `ackprof_D_outer`, `diag_ref_newkern` v2, `prof_on`):
+
+| Phase (routed GPU) | Time |
 |---|---|
-| RTX publishes the request (6 multicast writes) | 29 µs |
-| M10 round trip: compute, card sum, return, acks | 132 µs |
-| RTX combine | 9 µs |
-| **Whole layer** | **≈ 150 µs** (154 µs per row measured in `t20d`) |
+| Validate the request | 4.1 µs |
+| x staging + gate/up (1.64 MB FP8) | 33.8 µs |
+| Down (0.82 MB FP8) | 21.5 µs |
+| Leader: wait for the three peers' pushes (push + fence + flag ≈ 11 µs on the peer) | 13.3 µs |
+| Leader: own sum (2.0) + write + system fence (4.1) | 7.2 µs |
+| Leader: grid barrier + ack | 5.1 µs |
 
-Inside the round trip, for the slowest routed GPU (2026-11-02 profile): gate/up 39 µs, down 18–23 µs, the rest is the return over PCIe and the card-level sum. The slowest worker per request dropped from 146 µs to 103 µs with card-leader sums. The weights a GPU reads per token are only 2.5 MB (≈ 31 µs at bandwidth), so decode is **latency-bound**. 48 layers × ≈ 150 µs ≈ 7.4 ms of a 19 ms token.
+The rest of the 117.8 µs (≈ 27 µs) is the request reaching the workers and the last leader's data and header crossing the RTX's x4 link. That link carries all nine result rows (≈ 90 KB per layer per row), so it is the limit from 2 rows on: without the result writes (diagnostic `diag_nortx` v2) a layer is 2 / 20 / 54 µs faster at 1 / 2 / 4 rows.
+
+The compute is close to the M10's practical bandwidth: in `bench_m10_expert_compute` (runs `m10_compute_bench` v1/v2) the deployed gate/up + down take 56.3 µs, and the best variants (2 rows per warp, transposed down layout, up to 40 warps per SM) 50.3 µs. Gate/up stays at ≈ 30 µs (≈ 60 GB/s of the 83 GB/s peak) at any occupancy. [TRANSPORT.md §9](TRANSPORT.md#9-what-limits-the-decode-exchange) lists the transport experiments.
+
+Before the card-leader sums and mode 10 (mode 1, 2026-11-02, `t20d`): publish 29 µs, round trip 132 µs, combine 9 µs, ≈ 150 µs per layer.
 
 ### Prefill (mode 9, per 32-row chunk on the M10s)
 

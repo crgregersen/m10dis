@@ -32,7 +32,11 @@ assert pc in (None, "NONE"), f"peer client active: {pc}"
 print("DAEMON_BEFORE,pid,%s,activity,%s,kernel_reload,%s" % (s.get("pid"), s.get("worker_activity"), json.dumps(s.get("kernel_reload"))[:300]))
 PY
 inc=( -I"$REPO/transport/driver/abi/580.178.04" -I"$NVIDIA_SRC/common/inc" -I"$NVIDIA_SRC/nvidia-uvm" -I"$REPO/src" )
-nv() { "$NVCC" -O2 -std=c++17 -arch=sm_50 "$@" "${inc[@]}" --resource-usage -cubin >> "$RUN/build/cubins.log" 2>&1; }
+# Q38_RELOAD_NVCC_FLAGS (2026-11-04): extra nvcc flags for a measurement build, e.g. -DQ38_MR_PROFILE_BUILD (leader-finish
+# profile); empty = the default build. Recorded in the run log.
+read -r -a extra_flags <<< "${Q38_RELOAD_NVCC_FLAGS:-}"
+echo "RELOAD_NVCC_FLAGS,${Q38_RELOAD_NVCC_FLAGS:-none}"
+nv() { "$NVCC" -O2 -std=c++17 -arch=sm_50 "${extra_flags[@]}" "$@" "${inc[@]}" --resource-usage -cubin >> "$RUN/build/cubins.log" 2>&1; }
 nv "$REPO/src/resident_routed_kernel_v3_module.cu" -o "$RUN/build/routed_v3.cubin"
 nv "$REPO/src/resident_shared_kernel_v2_module.cu" -o "$RUN/build/shared_v2.cubin"
 sha256sum "$RUN"/build/*.cubin "$REPO"/src/pci_cluster_exchange.cuh "$REPO"/src/resident_dynamic_routed_v3.cuh "$REPO"/src/resident_routed_batch.cuh \
@@ -57,6 +61,6 @@ assert s.get("worker_activity") == "PARKED", s.get("worker_activity")
 kr = json.dumps(s.get("kernel_reload") or {})
 assert sys.argv[2] in kr and sys.argv[3] in kr, "daemon does not record the new images"
 print("KERNEL_RELOAD_STATE", kr[:500])
-print("DAEMON_AFTER,pid,%s,activity,PARKED,layers,48" % s.get("pid"))
+print("DAEMON_AFTER,pid,%s,activity,PARKED,layers,%s" % (s.get("pid"), s.get("layers_ready")))
 PY
 echo "PCI_CLUSTER_KERNEL_RELOAD_OK,$RUN"

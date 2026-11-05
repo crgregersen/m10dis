@@ -228,6 +228,18 @@ def _q38_batch_timing(worker=None) -> dict:
     gen = _torch.Generator(device="cpu").manual_seed(1234)
     med = lambda xs: round(st.median(xs) / 1e3, 1) if xs else None
 
+    def _q38_ack_profile_summary(recs, med):
+        # Q38_RTX_PEER_ACK_PROFILE=1: pad = (t_all - t_data) ns | last header << 24; data = 5 leaders + 4 shared
+        lag = [r["pad"] & 0xFFFFFF for r in recs if r.get("pad")]
+        last = [r["pad"] >> 24 for r in recs if r.get("pad")]
+        hist = {}
+        for w in last: hist[w] = hist.get(w, 0) + 1
+        data_ready = [r["t_ack"] - r["t_seq"] - (r["pad"] & 0xFFFFFF) for r in recs if r.get("pad")]
+        return {"ack_profiled": len(lag), "data9_ready": med(data_ready), "peers_after_data9": med(lag),
+                "peers_after_data9_max": round(max(lag) / 1e3, 1) if lag else None,
+                "peers_after_data9_zero": sum(1 for x in lag if x == 0),
+                "last_header_hist": dict(sorted(hist.items(), key=lambda kv: -kv[1])[:6])}
+
     def rtx_phases(recs):
         recs = [r for r in recs if r["layer"] < 48 and not r["skip"] and r["t_done"]]
         gaps = [b["t_begin"] - a["t_done"] for a, b in zip(recs, recs[1:]) if b["t_begin"] >= a["t_done"]]
@@ -235,7 +247,8 @@ def _q38_batch_timing(worker=None) -> dict:
                 "doorbell": med([r["t_seq"] - r["t_pub"] for r in recs]),
                 "wait_acks": med([r["t_ack"] - r["t_seq"] for r in recs]),
                 "combine": med([r["t_done"] - r["t_ack"] for r in recs]),
-                "total": med([r["t_done"] - r["t_begin"] for r in recs]), "gap_next": med(gaps)}
+                "total": med([r["t_done"] - r["t_begin"] for r in recs]), "gap_next": med(gaps),
+                **(_q38_ack_profile_summary(recs, med) if any(r.get("pad") for r in recs) else {})}
 
     def worker_phases(wrecs, routed_kind, shared_kind):
         # mode 8: routed kind 3, shared kind 4; mode 1: routed kind 1, shared kind 2 (per exchange = per row)
@@ -244,11 +257,18 @@ def _q38_batch_timing(worker=None) -> dict:
             if w["kind"] in (routed_kind, shared_kind) and w["t_done"] >= w["t_seen"]:
                 by_seq.setdefault(w["seq"], []).append(w)
         routed = [w for ws in by_seq.values() for w in ws if w["kind"] == routed_kind and w["t_down"]]
+        # Q38_RTX_PEER_MR_PROFILE=1 (mode 10 leaders): t_checked carries the packed finish phases, not a timestamp
+        isprof = lambda w: routed_kind == 7 and (w["t_checked"] >> 56) == 0xA5
+        prof = [w for w in routed if isprof(w)]
+        ph = lambda w, sh: ((w["t_checked"] >> sh) & 0x3FFF) * 32
         shared = [w for ws in by_seq.values() for w in ws if w["kind"] == shared_kind]
         return {"exchanges": len(by_seq),
                 # mode 8 (since step 2): t_checked is stamped after the host x staging, so the first field is check + stage
-                ("routed_check_stage" if routed_kind in (3, 5) else "routed_validate"): med([w["t_checked"] - w["t_seen"] for w in routed]),
-                ("routed_gate_up" if routed_kind in (3, 5) else "routed_stage_gate_up"): med([w["t_gateup"] - w["t_checked"] for w in routed]),
+                ("routed_check_stage" if routed_kind in (3, 5) else "routed_validate"): med([w["t_checked"] - w["t_seen"] for w in routed if not isprof(w)]),
+                ("routed_gate_up" if routed_kind in (3, 5) else "routed_stage_gate_up"): med([w["t_gateup"] - w["t_checked"] for w in routed if not isprof(w)]),
+                **({"leader_prof_n": len(prof), "leader_prof_reads": med([ph(w, 42) for w in prof]),
+                    "leader_prof_local_write": med([ph(w, 28) for w in prof]), "leader_prof_rtx_write": med([ph(w, 14) for w in prof]),
+                    "leader_prof_fence": med([ph(w, 0) for w in prof])} if prof else {}),
                 # mode 8 t_extra: high 32 = validation end - t_seen, low 32 = block 0's list build (ns); stage = the rest
                 **({"routed_validate8": med([(w.get("t_extra", 0) >> 32) for w in routed]),
                     "routed_stage8": med([w["t_checked"] - w["t_seen"] - (w.get("t_extra", 0) >> 32) for w in routed]),
@@ -256,6 +276,17 @@ def _q38_batch_timing(worker=None) -> dict:
                 "routed_down": med([w["t_down"] - w["t_gateup"] for w in routed]),
                 "routed_finish_leader": med([w["t_done"] - w["t_down"] for w in routed if w["role"] == 1]),
                 "routed_finish_peer": med([w["t_done"] - w["t_down"] for w in routed if w["role"] == 2]),
+                # mode 1 / 10 finish split (2026-11-04, t_extra): leader flags seen, leader / peer block-0 sum or push written,
+                # the rest of the leader finish = grid barrier (other blocks) + ack
+                **({"leader_wait_flags": med([w["t_extra"] >> 32 for w in routed if w["role"] == 1]),
+                    # NOTE (2026-11-04, T284): t_extra low 32 = t_sm - t_down, i.e. it INCLUDES the flag wait; the name is kept
+                    # for comparability with earlier runs. leader_sum_write_only_b0 = the leader's own sum + write + fence.
+                    "leader_sum_write_b0": med([w["t_extra"] & 0xFFFFFFFF for w in routed if w["role"] == 1]),
+                    "leader_sum_write_only_b0": med([(w["t_extra"] & 0xFFFFFFFF) - (w["t_extra"] >> 32) for w in routed
+                                                     if w["role"] == 1 and (w["t_extra"] >> 32)]),
+                    "leader_barrier_ack": med([w["t_done"] - w["t_down"] - (w["t_extra"] & 0xFFFFFFFF) for w in routed if w["role"] == 1]),
+                    "peer_push_b0": med([w["t_extra"] & 0xFFFFFFFF for w in routed if w["role"] == 2])}
+                   if routed_kind in (1, 7) else {}),
                 "shared_busy": med([w["t_done"] - w["t_seen"] for w in shared]),
                 # mode 8 shared (kind 4): t_checked = after x staging, t_gateup = after hidden (gate/up + gate), t_down = after down
                 **({"shared_stage8": med([w["t_checked"] - w["t_seen"] for w in shared]),
@@ -325,7 +356,7 @@ def _q38_batch_timing(worker=None) -> dict:
             routes = (wgt / wgt.sum(1, keepdim=True)).to("cuda:0")
             res, last = {"distinct_experts": int(_torch.unique(ids).numel())}, {}
             for path in paths:
-                if path == "multi" and not 2 <= R <= getattr(inner, "moe_multirow_max", 2):
+                if path == "multi" and not getattr(inner, "moe_multirow_min", 2) <= R <= getattr(inner, "moe_multirow_max", 2):
                     continue                      # the multi-row exchange takes 2..max rows
                 inner.moe_batch = path in ("batch", "pipe")
                 inner.moe_batch_pipe = path == "pipe"
