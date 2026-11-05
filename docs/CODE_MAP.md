@@ -83,6 +83,7 @@ Every file in `src/`, grouped by role. `src/` is flat because the runners and th
 | `build_bench_items.py`, `order_bench_items.py` | benchmark item files and their fixed order |
 | `score_lcb.py`, `score_mmlu.py`, `score_humaneval.py` | scorers |
 | `lm_head_floor.py` | LM-head jitter floor of repeated runs |
+| `bench_m10_expert_compute.cu` | 1-row routed gate/up + down on one M10 with synthetic FP8 weights: the deployed code (same headers as the worker cubin) against variants with more loads in flight or more blocks, bit-identity checked; `bench_m10_expert_compute OUT_JSON [iters]`, runs beside a parked daemon (≈ 180 MB on one GPU) |
 
 ## Tests
 
