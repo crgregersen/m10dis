@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
         CK(cudaMemcpy(b2s, hb.data(), 4 * nblocks, cudaMemcpyHostToDevice)); CK(cudaMemcpy(s2b, hs.data(), 4 * slots, cudaMemcpyHostToDevice)); CK(cudaMemcpy(ep, he.data(), 4 * slots, cudaMemcpyHostToDevice));
         Q38KvTierState hst{}; hst.enabled = 1; hst.slots = slots; CK(cudaMemcpy(st, &hst, sizeof hst, cudaMemcpyHostToDevice));
         uint32_t zero = 0; CK(cudaMemcpy(dbad, &zero, 4, cudaMemcpyHostToDevice));
-        Q38KvTierArgs a{din, dout, width, 1, dpos, kv, stride, TOKEN, PAGE, dtab, reinterpret_cast<uint8_t *>(hdev), b2s, s2b, ep, st};
+        Q38KvTierArgs a{din, dout, width, 1, dpos, kv, stride, TOKEN, PAGE, dtab, reinterpret_cast<uint8_t *>(hdev), b2s, s2b, ep, st, nullptr};
         cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
         std::vector<float> us; uint32_t bad_max = 0;
         for (int rep = 0; rep < repeat; rep++) for (size_t i = 0; i < pos.size(); i++) {

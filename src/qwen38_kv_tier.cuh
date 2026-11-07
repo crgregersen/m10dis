@@ -18,7 +18,8 @@ struct Q38KvTierState {
     uint32_t hand;
     uint32_t epoch;
     uint32_t nmiss;
-    uint32_t pad[3];
+    uint32_t overflow;                // CLOCK found nothing evictable: everything in the cache is pinned
+    uint32_t pad[2];
     uint64_t calls, selected, misses, new_tokens, max_miss, clock_steps;
     int32_t miss_block[Q38_KV_MAX_MISS];
     int32_t miss_entry[Q38_KV_MAX_MISS];   // first selection entry, -1 for the open group
@@ -41,6 +42,7 @@ struct Q38KvTierArgs {
     int32_t *slot_to_block;
     uint32_t *slot_epoch;             // 0 = evictable, current epoch = pinned, older = second chance
     Q38KvTierState *st;
+    const uint8_t *inbox;             // phase 2: new K/V, row * 2 KB, already in host RAM; null: at the real position
 };
 
 __device__ __forceinline__ uint8_t *q38_kv_addr(const Q38KvTierArgs &a, uint64_t token) {
@@ -109,6 +111,7 @@ __global__ static void q38_kv_resolve_kernel(Q38KvTierArgs a) {
             for (uint32_t m = 0; m < n; m++) {
                 for (;;) {
                     steps++;
+                    if (steps > 3ull * st->slots) { st->overflow++; break; }
                     const uint32_t e = a.slot_epoch[hand];
                     if (e == epoch) { hand = hand + 1 == st->slots ? 0 : hand + 1; continue; }
                     if (e != 0) { a.slot_epoch[hand] = 0; hand = hand + 1 == st->slots ? 0 : hand + 1; continue; }
@@ -147,12 +150,13 @@ __global__ static void q38_kv_resolve_kernel(Q38KvTierArgs a) {
         for (int32_t j = expanded + int32_t(t); j < count; j += int32_t(T))
             out[j] = ns * int32_t(Q38_KV_BLOCK_TOKENS) + (in[j] & 3);
         const uint64_t virt = uint64_t(ns) * Q38_KV_BLOCK_TOKENS + uint64_t(p & 3);
-        const uint4 *from = reinterpret_cast<const uint4 *>(q38_kv_addr(a, uint64_t(p)));
+        const uint4 *from = reinterpret_cast<const uint4 *>(a.inbox ? a.inbox + uint64_t(r) * 2048u : q38_kv_addr(a, uint64_t(p)));
         uint4 *to = reinterpret_cast<uint4 *>(q38_kv_addr(a, virt));
         uint4 *host = reinterpret_cast<uint4 *>(a.host + uint64_t(p) * 2048u);
         for (uint32_t w = t; w < Q38_KV_TOKEN_VEC; w += T) {
             const uint4 x = from[w];
-            to[w] = x; host[w] = x;
+            to[w] = x;
+            if (!a.inbox) host[w] = x;
         }
         __syncthreads();
     }
@@ -173,4 +177,14 @@ __global__ static void q38_kv_verify_kernel(Q38KvTierArgs a, uint32_t cache_toke
         atomicAdd(checked, 1ull);
         if (diff) atomicAdd(bad, 1ull);
     }
+}
+
+// Phase 2: all rows' new K/V from the inbox to host RAM, before any row of this call can select them.
+__global__ static void q38_kv_write_through_kernel(const uint4 *inbox, uint8_t *host, const int64_t *positions, uint32_t rows) {
+    const uint32_t n = rows * Q38_KV_TOKEN_VEC;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const uint32_t r = i / Q38_KV_TOKEN_VEC, w = i % Q38_KV_TOKEN_VEC;
+        reinterpret_cast<uint4 *>(host + uint64_t(positions[r]) * 2048u)[w] = inbox[i];
+    }
+    __threadfence_system();
 }

@@ -86,6 +86,7 @@ Every file in `src/`, grouped by role. `src/` is flat because the runners and th
 | `bench_m10_expert_compute.cu` | 1-row routed gate/up + down on one M10 with synthetic FP8 weights: the deployed code (same headers as the worker cubin) against variants with more loads in flight or more blocks, bit-identity checked; `bench_m10_expert_compute OUT_JSON [iters]`, runs beside a parked daemon (≈ 180 MB on one GPU) |
 | `qwen38_kv_tier.cuh`, `qwen38_kv_tier_hook.py` | Host-memory K/V tier: the `q38_kv_resolve` kernel and the vLLM hook around `forward_qsa`. |
 | `bench_kv_tier.cu` | Unit bench of `q38_kv_resolve` on the RTX: replays logged selections with synthetic K/V and checks every entry. |
+| `analyze_kv_layout.py` | Tries K/V layouts offline from a `Q38_KV_CONFIG_DUMP` file, no GPU. |
 | `qwen38_qsa_select_log.py`, `analyze_qsa_selection.py`, `analyze_qsa_bursts.py` | Log the indexer selections, then analyze balance, overlap, cache hit rate and miss bursts. |
 
 ## Tests

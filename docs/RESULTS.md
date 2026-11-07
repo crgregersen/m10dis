@@ -157,6 +157,15 @@ An experimental tier keeps a VRAM cache of the K/V blocks in use and copies miss
 
 Byte comparison with the true K/V: 0 bad of 24,569,400 selected entries (`kv_tier_verify` v2).
 
+With K/V fully out of vLLM's pool (`Q38_KV_TIER_OWN=1`, 0 drafts), the context is no longer limited by the RTX:
+
+| Prompt | Cache per layer | Pool | Prefill | Decode | Runs |
+|---|---|---|---|---|---|
+| 120,047 tokens | 32k tokens | 0.6 GiB | ≈ 245 tok/s | 52.7 tok/s | `kv_own_120k` v3 |
+| 255,047 tokens | 48k tokens | 0.8 GiB | ≈ 237 tok/s | 51.4 tok/s | `kv_own_255k_speed`, `kv_own_255k_verify` |
+
+Byte comparison at 255k: 0 bad of 397,725,744 selected entries. K/V takes about 6 GB of host RAM at this length.
+
 ## Accuracy
 
 Benchmarks ran on 2026-11-04 with the frozen benchmark configuration ([BENCHMARKS.md](BENCHMARKS.md)). Each was compared with the model card's published number, against a threshold registered before the run.

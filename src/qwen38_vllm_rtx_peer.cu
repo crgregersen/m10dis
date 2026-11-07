@@ -2689,10 +2689,17 @@ extern "C" int q38_kv_tier_populate(const uint8_t *kv, uint64_t block_stride, ui
 }
 extern "C" int q38_kv_resolve(const int32_t *in, int32_t *out, uint32_t width, uint32_t rows, const int64_t *positions, uint8_t *kv,
         uint64_t block_stride, uint32_t token_stride, uint32_t page_tokens, const int32_t *block_table, uint8_t *host,
-        int32_t *block_to_slot, int32_t *slot_to_block, uint32_t *slot_epoch, Q38KvTierState *st, void *stream, char *err, size_t cap) {
+        int32_t *block_to_slot, int32_t *slot_to_block, uint32_t *slot_epoch, Q38KvTierState *st, const uint8_t *inbox, void *stream, char *err, size_t cap) {
     try {
-        Q38KvTierArgs a{in, out, width, rows, positions, kv, block_stride, token_stride, page_tokens, block_table, host, block_to_slot, slot_to_block, slot_epoch, st};
+        Q38KvTierArgs a{in, out, width, rows, positions, kv, block_stride, token_stride, page_tokens, block_table, host, block_to_slot, slot_to_block, slot_epoch, st, inbox};
         q38_kv_resolve_kernel<<<1, 1024, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a);
+        CK(cudaGetLastError());
+        return 0;
+    } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
+}
+extern "C" int q38_kv_write_through(const uint8_t *inbox, uint8_t *host, const int64_t *positions, uint32_t rows, void *stream, char *err, size_t cap) {
+    try {
+        q38_kv_write_through_kernel<<<rows < 64u ? 1u : 16u, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const uint4 *>(inbox), host, positions, rows);
         CK(cudaGetLastError());
         return 0;
     } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
@@ -2701,7 +2708,7 @@ extern "C" int q38_kv_verify(const int32_t *in, int32_t *out, uint32_t width, co
         uint64_t block_stride, uint32_t token_stride, uint32_t page_tokens, const int32_t *block_table, uint8_t *host,
         Q38KvTierState *st, uint32_t cache_tokens, uint64_t *checked, uint64_t *bad, void *stream, char *err, size_t cap) {
     try {
-        Q38KvTierArgs a{in, out, width, 1, positions, kv, block_stride, token_stride, page_tokens, block_table, host, nullptr, nullptr, nullptr, st};
+        Q38KvTierArgs a{in, out, width, 1, positions, kv, block_stride, token_stride, page_tokens, block_table, host, nullptr, nullptr, nullptr, st, nullptr};
         q38_kv_verify_kernel<<<16, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a, cache_tokens, reinterpret_cast<unsigned long long *>(checked), reinterpret_cast<unsigned long long *>(bad));
         CK(cudaGetLastError());
         return 0;

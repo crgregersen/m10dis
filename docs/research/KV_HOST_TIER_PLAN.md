@@ -1,6 +1,6 @@
 # Plan: host-memory K/V tier for the full-attention layers
 
-**Status: Phases 0 and 1 done. Phase 2 not started.** Goal: decode at up to 262k tokens on the 8 GB RTX, with K/V in host RAM and a VRAM cache of the blocks in use. Numbers marked *(estimate)* are calculations. Background: [KV_ATTENTION_ON_M10.md](KV_ATTENTION_ON_M10.md), runs `qsa_select_*` (T319–T322).
+**Status: Phases 0–3 done for 0 drafts, up to 255k tokens. Drafts with K/V out of the pool are not tested yet.** Goal: decode at up to 262k tokens on the 8 GB RTX, with K/V in host RAM and a VRAM cache of the blocks in use. Numbers marked *(estimate)* are calculations. Background: [KV_ATTENTION_ON_M10.md](KV_ATTENTION_ON_M10.md), runs `qsa_select_*` (T319–T322).
 
 ## The idea
 
@@ -74,6 +74,24 @@ Correctness: 0 bad of 24,569,400 selected entries, comparing the 2 KB of K/V aga
 Long-context acceptance at 2 drafts stayed high on this prompt: 87 / 74 % per position, 2.6 tokens per step, about 85 tok/s. The prompt's review task quotes its own text, so this is not a general figure.
 
 Costs run a little above the simulation: misses move at about 2.2 GB/s rather than 3.2 GB/s. The copy cost dominates: `RESOLVE` itself is small.
+
+## Phases 2 and 3 results
+
+K/V is out of vLLM's pool (`Q38_KV_TIER_OWN=1`). The QSA spec shrinks to a stub, each layer owns its cache and an identity page table, new K/V goes through an inbox to host RAM, and each call resolves and attends in sub-chunks of 16 rows. The MTP layer stays in the pool.
+
+| Prompt, drafts | Cache per layer | Pool | Prefill | Decode | Byte check | Runs |
+|---|---|---|---|---|---|---|
+| 28k, 0 | 16k tokens | 1.6 GiB | not timed | eager | 0 bad of 46.4M | T350 |
+| 120k, 0 | 32k tokens (0.8 GB) | 0.6 GiB | ≈ 245 tok/s | 52.7 tok/s | not run | T353 |
+| 255k, 0 | 48k tokens (1.2 GB) | 0.8 GiB | ≈ 237 tok/s, 18 minutes | 51.4 tok/s | 0 bad of 397.7M | T354–T356 |
+
+The byte check covers the first row of each sub-chunk in prefill, and every row in decode. Hit rates include prefill: 98.6 % at 120k, 97.9 % at 255k. There were no overflows.
+
+Prefill beat the plan's estimate of about 200 tok/s, and the cache was enough: the union per call is large, but 16 consecutive rows overlap heavily.
+
+At 255k the prompt's first generated token was `<|im_end|>` at logprob −0.01: a raw code dump reads as a finished user turn. This is the model's choice, not a fault (T354, T355). With `ignore_eos` the text is coherent, and it lists files from the start of the prompt.
+
+Not tested yet: drafts with K/V out of the pool, and the full 262,144 tokens. vLLM's own figure for 2 drafts at 262k is a 1.34 GiB pool (`analyze_kv_layout.py`).
 
 ## Phases
 

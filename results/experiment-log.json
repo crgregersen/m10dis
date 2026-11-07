@@ -2254,6 +2254,121 @@
    "retry_of": "kv_tier_c64k_20261107_v1",
    "pueue_task": 345,
    "result": "78k, k=0, cache 65k. Hit 99.37 %. 54.4 tok/s, +0.20 ms per token against 55.0."
+  },
+  {
+   "label": "kv_config_dump_20261107_v1",
+   "what": "short normal run, 2 drafts, max_model_len 64000, 8 new tokens, saves the inputs of get_kv_cache_configs",
+   "goal": "KV_HOST_TIER_PLAN phase 2: try a shrunken K/V spec offline, no hardware needed for that",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "PASS, normal generation; pickle written. No retry.",
+   "pueue_task": 346,
+   "result": "The dump hook raised: ctypes objects in vllm_config cannot be pickled. Engine setup stopped; cleanup PASS, daemon parked."
+  },
+  {
+   "label": "kv_config_dump_20261107_v2",
+   "what": "short normal run, 2 drafts, max_model_len 64000, 8 new tokens, saves the inputs of get_kv_cache_configs",
+   "goal": "KV_HOST_TIER_PLAN phase 2: try a shrunken K/V spec offline, no hardware needed for that",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "PASS, normal generation; pickle written. No retry.",
+   "retry_of": "kv_config_dump_20261107_v1",
+   "pueue_task": 347,
+   "result": "Normal run, inputs saved. Offline with analyze_kv_layout.py: today reproduced (concurrency 1.15). With main K/V shrunk vLLM accepts max_model_len 262144: pool 1.34 GiB, 0.84 GiB with the MTP K/V out too, against 7.24 GiB today. Attention group page 43.9 MB -> 5.2 MB; GDN state moves to 37 one-layer groups."
+  },
+  {
+   "label": "kv_own_verify_20261107_v1",
+   "what": "phase 2: K/V out of the pool (Q38_KV_TIER_OWN=1), 28k docs prompt, k=0, eager, cache 16k tokens, pool 1.6 GiB, byte check, 200 new tokens",
+   "goal": "first run with the tier owning K/V in prefill and decode: byte check of the first row of every sub-chunk, prefill speed",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "0 bad, 0 overflow; generation plausible; prefill slower than 277 tok/s, cost unknown. No retry.",
+   "pueue_task": 348,
+   "result": "KeyError 'inbox': the K/V write runs before the first attention call, which created the inbox. Startup with the stub spec worked. Cleanup OK."
+  },
+  {
+   "label": "kv_own_verify_20261107_v2",
+   "what": "phase 2: K/V out of the pool (Q38_KV_TIER_OWN=1), 28k docs prompt, k=0, eager, cache 16k tokens, pool 1.6 GiB, byte check, 200 new tokens",
+   "goal": "first run with the tier owning K/V in prefill and decode: byte check of the first row of every sub-chunk, prefill speed",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "0 bad, 0 overflow; generation plausible; prefill slower than 277 tok/s, cost unknown. No retry.",
+   "retry_of": "kv_own_verify_20261107_v1",
+   "pueue_task": 349,
+   "result": "Client PASS, but byte check 7,367,935 bad of 46,411,800: wrong inbox stride in the hook (4,096 instead of 2,048 bytes per row), so sub-chunks after the first cached the wrong rows. Host RAM was correct."
+  },
+  {
+   "label": "kv_own_verify_20261107_v3",
+   "what": "phase 2: K/V out of the pool (Q38_KV_TIER_OWN=1), 28k docs prompt, k=0, eager, cache 16k tokens, pool 1.6 GiB, byte check, 200 new tokens",
+   "goal": "first run with the tier owning K/V in prefill and decode: byte check of the first row of every sub-chunk, prefill speed",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "0 bad, 0 overflow; generation plausible; prefill slower than 277 tok/s, cost unknown. No retry.",
+   "retry_of": "kv_own_verify_20261107_v2",
+   "pueue_task": 350,
+   "result": "0 bad of 46,411,800, 0 overflow, hit 99.5 %, 28k context, cache 16k, K/V fully out of the pool in prefill and decode. Text coherent."
+  },
+  {
+   "label": "kv_own_120k_20261107_v1",
+   "what": "120k code prompt, k=0, graph decode, max_model_len 131072, K/V out of the pool, cache 32k tokens, pool 1.6 GiB, 1000 new tokens",
+   "goal": "KV_HOST_TIER_PLAN phase 2 gate: context above what the pool can hold (about 95k)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "PASS, 0 overflow; hit about 95 %; about 52 tok/s decode; prefill about 150-250 tok/s late. No retry.",
+   "pueue_task": 351,
+   "result": "Failed at engine start in graph mode: the Triton warm-up uses the stub K/V shape, and head_size 8 is below the tl.dot minimum of 16. Cleanup OK. Eager runs have no warm-up, so T350 did not see it."
+  },
+  {
+   "label": "kv_own_120k_20261107_v2",
+   "what": "120k code prompt, k=0, graph decode, max_model_len 131072, K/V out of the pool, cache 32k tokens, pool 1.6 GiB, 1000 new tokens, stub head_size 16",
+   "goal": "KV_HOST_TIER_PLAN phase 2 gate: context above what the pool can hold (about 95k)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "PASS, 0 overflow; hit about 95 %; about 52 tok/s decode; prefill about 150-250 tok/s late. No retry.",
+   "retry_of": "kv_own_120k_20261107_v1",
+   "pueue_task": 352,
+   "result": "RTX out of memory in graph capture: 3.62 GiB weights, 1.6 GiB pool, 0.83 GiB tier cache. vLLM reported 573,708 tokens at 1.6 GiB (concurrency 4.38 at 131072), so the pool was about 4x too large. Stub spec and startup worked. Cleanup OK."
+  },
+  {
+   "label": "kv_own_120k_20261107_v3",
+   "what": "120k code prompt, k=0, graph decode, max_model_len 131072, K/V out of the pool, cache 32k tokens, pool 0.6 GiB, 1000 new tokens, stub head_size 16",
+   "goal": "KV_HOST_TIER_PLAN phase 2 gate: context above what the pool can hold (about 95k)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "PASS, 0 overflow; hit about 95 %; about 52 tok/s decode; prefill about 150-250 tok/s late. No retry.",
+   "retry_of": "kv_own_120k_20261107_v2",
+   "pueue_task": 353,
+   "result": "PASS, first context above the pool. 120,047-token prompt, 1000 tokens, 52.7 tok/s decode window (graph), prefill about 245 tok/s (507 s total), hit 98.6 % over prefill and decode, 0 overflow, text coherent, all checks OK. Pool 0.6 GiB, cache 32k tokens."
+  },
+  {
+   "label": "kv_own_255k_20261107_v1",
+   "what": "255k code prompt, k=0, graph decode, max_model_len 262144, K/V out of the pool, cache 48k tokens (1.2 GB), pool 0.8 GiB, 1000 new tokens",
+   "goal": "KV_HOST_TIER_PLAN phase 3 gate: near the full model context on the 8 GB RTX",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "PASS, 0 overflow; decode about 50-53 tok/s; prefill about 200-240 tok/s, about 18-21 minutes. No retry.",
+   "pueue_task": 354,
+   "result": "Client PASS, prefill of 255,047 tokens in about 1075 s (237 tok/s), 0 overflow, hit 97.9 %, all checks OK, pool 0.8 GiB. But generation stopped at once: 1 token, finish stop, empty text. Not a pass until explained."
+  },
+  {
+   "label": "kv_own_255k_verify_20261107_v1",
+   "what": "255k code prompt, eager, ignore_eos, logprobs 5, byte check, cache 48k, pool 0.8 GiB, 300 new tokens",
+   "goal": "explain the immediate stop of T354: is the first token a real model choice, is the K/V correct at 255k, is later text coherent",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "0 bad; if the stop token wins by a clear margin and later text is coherent, it was a model choice on this prompt. No retry.",
+   "pueue_task": 355,
+   "result": "0 bad of 397,725,744 selected entries, 0 overflow, hit 97.9 %. First token <|im_end|> at logprob -0.01: a model choice, the raw dump reads as a finished user turn. With ignore_eos the model writes <|im_start|>assistant and a coherent review, listing the files in order from the start of the 255k prompt. Explains T354."
+  },
+  {
+   "label": "kv_own_255k_speed_20261107_v1",
+   "what": "255k code prompt, graph decode, ignore_eos, cache 48k, pool 0.8 GiB, 1000 new tokens",
+   "goal": "decode tok/s at near full context",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "about 50-53 tok/s. No retry.",
+   "pueue_task": 356,
+   "result": "PASS. 255,047-token prompt, 1000 tokens, 51.4 tok/s decode window (graph), prefill about 237 tok/s, hit 97.9 % over prefill and decode, 0 overflow, all checks OK."
   }
  ]
 }
