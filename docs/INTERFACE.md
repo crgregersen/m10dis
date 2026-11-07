@@ -181,6 +181,9 @@ Tests: `src/run_pci_cluster_row_gather_test.sh` (both worker kernels on the RTX 
 | `Q38_RTX_PEER_MR_DIAG_NORTX=1` | Diagnostic, **results invalid**: card leaders and shared workers skip their result writes to the RTX (multi-row block flag `Q38_MR_FLAG_DIAG_NORTX`); measures the RTX link's share of the finish |
 | `Q38_RTX_PEER_MR_PROFILE=1` | Card leaders record the phases of their finish in the worker timing record (`Q38_MR_FLAG_PROFILE`; harness fields `leader_prof_*`). Needs worker kernels built with `-DQ38_MR_PROFILE_BUILD` (otherwise ignored) |
 | `Q38_RTX_PEER_MR_LL=1` | LL peer push for 1-row exchanges (`Q38_MR_FLAG_LL`, layout in `resident_multirow_abi.cuh`). Needs kernels built with `-DQ38_MR_LL_BUILD` and `Q38_RTX_PEER_MOE_MULTIROW_MAX=4` (the LL row lives in the rows ≥ 1 peer blocks). PoC, not faster overall (TRANSPORT.md §9) |
+| `Q38_KV_TIER=1` | Host-memory K/V tier for the QSA layers, decode only ([plan](research/KV_HOST_TIER_PLAN.md)). `Q38_KV_TIER_TOKENS` sets the VRAM cache per layer (default 32768, multiple of 4). Turns on per layer when prefill ends, if the context is longer than the cache. |
+| `Q38_KV_TIER_VERIFY=1` | With the tier, eager decode only: compares the K/V of every selected entry with its true bytes. `Q38_KV_TIER_REPORT=FILE` writes per-layer hit rates and counts. |
+| `Q38_QSA_SELECT_LOG=FILE` | Logs the indexer selections of decode rows, eager decode only (`Q38_VLLM_CUDAGRAPH=0`). `Q38_QSA_UNION_LOG=CSV` also logs distinct blocks per prefill call. Files get a `.PID` suffix. |
 | `Q38_VLLM_IGNORE_EOS=1` | Generation mode always produces `--max-new-tokens` (equal-length speed comparisons) |
 | `Q38_NSYS=1`, `Q38_CUDA_PROFILER_START_TOKENS`, `Q38_CUDA_PROFILER_TOKENS` | Run the client under `nsys profile --capture-range=cudaProfilerApi`; the adapter opens the range at that decode step for that many steps |
 | `Q38_PYSPY_SECONDS` | Non-blocking py-spy record of the engine during steady decode |

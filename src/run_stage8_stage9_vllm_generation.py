@@ -374,6 +374,12 @@ def install_model_hooks(adapter: Any, ple_socket: Path | None) -> dict[str, Any]
     # Opt-in FP8 hyper-connection matrices (Q38_RTX_FP8_HC=1, qwen38_hc_fp8; 2026-11-03).
     from qwen38_hc_fp8 import install as install_hc_fp8
     rtx_fp8_hc = install_hc_fp8()
+    # Opt-in logging of the QSA indexer selections (Q38_QSA_SELECT_LOG, eager decode only).
+    from qwen38_qsa_select_log import install as install_qsa_select_log
+    install_qsa_select_log()
+    # Opt-in host-memory K/V tier for the QSA layers (Q38_KV_TIER=1).
+    from qwen38_kv_tier_hook import install as install_kv_tier
+    install_kv_tier()
     RemotePleEmbedding._client = None
     return {
         "moe_class": f"{moe_cls.__module__}.{moe_cls.__name__}",

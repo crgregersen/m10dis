@@ -144,6 +144,19 @@ KV capacity at 2.5 GiB in the MTP runs (`max_model_len` 32,768), from the vLLM s
 
 With prefix caching on, vLLM's Mamba "align" mode stores a GDN state snapshot for every 1,568-token block. That costs 72.8 KB per token instead of 31.6 KB.
 
+### K/V in host memory
+
+An experimental tier keeps a VRAM cache of the K/V blocks in use and copies misses from host RAM (`Q38_KV_TIER=1`, off by default, [plan](research/KV_HOST_TIER_PLAN.md)). Decode only, so far within the pool. Runs `kv_tier_*`, pueue tasks 326–345:
+
+| Context, drafts | Cache per layer | Hit | Without tier | With tier | Cost |
+|---|---|---|---|---|---|
+| 78k, 0 | 16k tokens (384 MB) | 92.7 % | 55.0 tok/s | 50.4 tok/s | +1.66 ms per token |
+| 78k, 0 | 32k tokens (768 MB) | 97.5 % | 55.0 tok/s | 53.3 tok/s | +0.59 ms per token |
+| 78k, 0 | 65k tokens (1.5 GB) | 99.4 % | 55.0 tok/s | 54.4 tok/s | +0.20 ms per token |
+| 60k, 2 | 32k tokens | 98.5 % | 33.1 steps/s | 32.0 steps/s | +1.04 ms per step |
+
+Byte comparison with the true K/V: 0 bad of 24,569,400 selected entries (`kv_tier_verify` v2).
+
 ## Accuracy
 
 Benchmarks ran on 2026-11-04 with the frozen benchmark configuration ([BENCHMARKS.md](BENCHMARKS.md)). Each was compared with the model card's published number, against a threshold registered before the run.

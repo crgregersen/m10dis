@@ -2614,6 +2614,7 @@ extern "C" int q38_rtx_peer_row_gather_gpu(const long long *rows, uint32_t n, ui
         g_peer_error = e.what(); if (err && cap) std::snprintf(err, cap, "%s", g_peer_error.c_str()); return 1;
     }
 }
+#include "qwen38_kv_tier.cuh"
 // ---------------------------------------------------------------------------------------------
 // Zero-copy row gather from a pinned host table (2026-11-03, Q38_EMBEDDING_ZERO_COPY=1): the RTX
 // reads the needed rows straight from host RAM over PCIe (one 5-KiB row per decoded token), so the
@@ -2667,6 +2668,44 @@ extern "C" int q38_zero_copy_gather(const void *device_table, unsigned long long
     } catch (const std::exception &e) {
         if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1;
     }
+}
+// Host-memory K/V tier (docs/research/KV_HOST_TIER_PLAN.md, Q38_KV_TIER=1): see qwen38_kv_tier.cuh.
+extern "C" size_t q38_kv_tier_state_size() { return sizeof(Q38KvTierState); }
+extern "C" int q38_kv_tier_register(void *host, size_t bytes, void **device_ptr, char *err, size_t cap) {
+    try {
+        CK(cudaHostRegister(host, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable));
+        CK(cudaHostGetDevicePointer(device_ptr, host, 0));
+        return 0;
+    } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
+}
+// Copy `pages` pool pages of one layer to host RAM, in token order. `table`: host copy of the block table.
+extern "C" int q38_kv_tier_populate(const uint8_t *kv, uint64_t block_stride, uint32_t page_tokens, uint32_t token_stride,
+        const int32_t *table, uint32_t pages, uint8_t *host, char *err, size_t cap) {
+    try {
+        for (uint32_t i = 0; i < pages; i++)
+            CK(cudaMemcpy(host + uint64_t(i) * page_tokens * 2048u, kv + uint64_t(table[i]) * block_stride, uint64_t(page_tokens) * token_stride, cudaMemcpyDeviceToHost));
+        return 0;
+    } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
+}
+extern "C" int q38_kv_resolve(const int32_t *in, int32_t *out, uint32_t width, uint32_t rows, const int64_t *positions, uint8_t *kv,
+        uint64_t block_stride, uint32_t token_stride, uint32_t page_tokens, const int32_t *block_table, uint8_t *host,
+        int32_t *block_to_slot, int32_t *slot_to_block, uint32_t *slot_epoch, Q38KvTierState *st, void *stream, char *err, size_t cap) {
+    try {
+        Q38KvTierArgs a{in, out, width, rows, positions, kv, block_stride, token_stride, page_tokens, block_table, host, block_to_slot, slot_to_block, slot_epoch, st};
+        q38_kv_resolve_kernel<<<1, 1024, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a);
+        CK(cudaGetLastError());
+        return 0;
+    } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
+}
+extern "C" int q38_kv_verify(const int32_t *in, int32_t *out, uint32_t width, const int64_t *positions, uint8_t *kv,
+        uint64_t block_stride, uint32_t token_stride, uint32_t page_tokens, const int32_t *block_table, uint8_t *host,
+        Q38KvTierState *st, uint32_t cache_tokens, uint64_t *checked, uint64_t *bad, void *stream, char *err, size_t cap) {
+    try {
+        Q38KvTierArgs a{in, out, width, 1, positions, kv, block_stride, token_stride, page_tokens, block_table, host, nullptr, nullptr, nullptr, st};
+        q38_kv_verify_kernel<<<16, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a, cache_tokens, reinterpret_cast<unsigned long long *>(checked), reinterpret_cast<unsigned long long *>(bad));
+        CK(cudaGetLastError());
+        return 0;
+    } catch (const std::exception &e) { if (err && cap) std::snprintf(err, cap, "%s", e.what()); return 1; }
 }
 // Enqueue one LM-head top-k exchange for one row: x (QWEN_H values, h_type 0 f32 / 1 f16 / 2 bf16, device)
 // -> out (vocab BF16 logits: top candidates, -inf elsewhere), lse_out (FP32 global log-sum-exp, may be
