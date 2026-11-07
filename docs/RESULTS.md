@@ -146,7 +146,7 @@ With prefix caching on, vLLM's Mamba "align" mode stores a GDN state snapshot fo
 
 ### K/V in host memory
 
-An experimental tier keeps a VRAM cache of the K/V blocks in use and copies misses from host RAM (`Q38_KV_TIER=1`, off by default, [plan](research/KV_HOST_TIER_PLAN.md)). Decode only, so far within the pool. Runs `kv_tier_*`, pueue tasks 326–345:
+An experimental tier keeps a VRAM cache of the K/V blocks in use and copies misses from host RAM (`Q38_KV_TIER=1`, off by default, [KV_TIER.md](KV_TIER.md)). Decode only, so far within the pool. Runs `kv_tier_*`, pueue tasks 326–345:
 
 | Context, drafts | Cache per layer | Hit | Without tier | With tier | Cost |
 |---|---|---|---|---|---|
@@ -167,6 +167,8 @@ With K/V fully out of vLLM's pool (`Q38_KV_TIER_OWN=1`, 0 drafts), the context i
 Byte comparison at 255k: 0 bad of 397,725,744 selected entries. K/V takes about 6 GB of host RAM at this length.
 
 With 2 drafts: ≈ 72 tok/s at 120k and ≈ 66 tok/s at 255k, one measurement each (one 10-second window × tokens per step, runs `kv_own_k2_120k` v2, `kv_own_k2_255k` v2). Byte comparison at 120k: 0 bad of 192,342,684.
+
+A real chat request of 260,951 tokens (`kv_own_chat_261k`) answered a recall question correctly, quoting the first line of the context exactly, at about 68 tok/s with 2 drafts. Humaneval after 120k tokens of context: about 84 tok/s with 2 drafts and 83 with 3 (`kv_own_H120k_k2`, `_k3`).
 
 ## Accuracy
 

@@ -61,6 +61,7 @@ This is a **research system for one specific machine**, published so others can 
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): what runs where, and one token's path through a layer
 - [TRANSPORT.md](docs/TRANSPORT.md): multicast, page-table remapping, return slots, card-level sums, the exchange modes
+- [KV_TIER.md](docs/KV_TIER.md): optional K/V tier, sparse-attention K/V in host RAM with a VRAM block cache, up to 262k tokens on the RTX
 - [HARDWARE.md](docs/HARDWARE.md): board, switches, power, the I/O-port-space problem, the late-enable boot, cooling
 - [BUILD.md](docs/BUILD.md): kernel, UVM module, worker kernels, RTX library, Python environment
 - [PREPARE.md](docs/PREPARE.md): model files, expert bundles, n-gram shards, LM head, topology

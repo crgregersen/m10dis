@@ -2420,6 +2420,56 @@
    "retry_of": "kv_own_k2_255k_20261107_v1",
    "pueue_task": 361,
    "result": "PASS. 255,047-token prompt, 2 drafts, graph, ignore_eos, 1000 tokens: 29.2 steps/s in the last full 10 s window, 2.26 tokens per step, about 66 tok/s; accepted 73.8/52.3 %; hit 96.3 %, 0 overflow; prefill about 217 tok/s (19.6 minutes); pool 1.55 GiB, cache 32k, indexer workspace 48 MiB. Memory fit."
+  },
+  {
+   "label": "kv_own_chat_261k_20261107_v1",
+   "what": "chat template, about 261k-token user message with a recall question, 2 drafts, graph, K/V out of the pool, cache 32k, pool 1.55 GiB, indexer workspace 48 MiB, max_model_len 262144, up to 1000 new tokens, no ignore_eos",
+   "goal": "real use at the full context: normal answer, recall of the first and last file",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "PASS, no immediate stop, answer names the right files; prefill about 20 minutes. No retry.",
+   "pueue_task": 362,
+   "result": "PASS. 260,951-token chat prompt, 2 drafts, graph. Stopped normally after 739 tokens. Recall correct: first file, last file, first line quoted exactly, project summary. Accepted 86.3/73.6 %, 2.6 tokens per step, 26.0 steps/s, about 68 tok/s, one window. 1244.8 s total. Hit 95.7 %, 0 overflow, all checks OK."
+  },
+  {
+   "label": "kv_own_H_k2_20261107_v1",
+   "what": "humaneval prompt, ignore_eos, 2 drafts, graph, K/V out of the pool, cache 16k, pool 1.0 GiB, 1000 new tokens",
+   "goal": "tier cost on code at short context, against T317 88.3 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "about 85-88 tok/s, nearly all hits. No retry.",
+   "pueue_task": 363,
+   "result": "14.33 s, 69.8 tok/s overall; 33.2 steps/s and 2.67 tokens per step in the steady window, about 88.5 tok/s. Accepted 88.5/77.9 %. Not comparable with T317: text diverges at token 77, T317 falls into a repetitive assert loop (94 unique tokens), this run writes normal code (270). First window slow, about 3 s: the real attention kernel compiles at first use, warm-up only sees the stub."
+  },
+  {
+   "label": "kv_own_H120k_k2_20261107_v1",
+   "what": "humaneval prompt after 120k tokens of code, ignore_eos, 2 drafts, graph, K/V out of the pool, cache 32k, pool 1.3 GiB, 1000 new tokens",
+   "goal": "draft speed on code at long context",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "close to the short-context rate minus about 0.5 ms per row, if acceptance holds. No retry.",
+   "pueue_task": 365,
+   "result": "120,266-token prompt, 31.4 steps/s, 2.69 tokens per step, about 84 tok/s. Accepted 89.5/79.3 %, hit 98.6 %, 508 s total."
+  },
+  {
+   "label": "kv_own_H_k3_20261107_v1",
+   "what": "humaneval prompt, ignore_eos, 3 drafts, graph, K/V out of the pool, cache 16k, pool 1.0 GiB, 1000 new tokens",
+   "goal": "tier cost on code at short context, against T318 96.3 tok/s",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "about 92-96 tok/s, nearly all hits. No retry.",
+   "pueue_task": 364,
+   "result": "12.20 s, 81.9 tok/s overall, no full steady window. Accepted 84.4/74.7/66.2 %, 3.25 tokens per step. Same text as T363, diverges from T318 at token 77."
+  },
+  {
+   "label": "kv_own_H120k_k3_20261107_v1",
+   "what": "humaneval prompt after 120k tokens of code, ignore_eos, 3 drafts, graph, K/V out of the pool, cache 32k, pool 1.3 GiB, 1000 new tokens",
+   "goal": "draft speed on code at long context",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "close to the short-context rate minus about 0.5 ms per row, if acceptance holds. No retry.",
+   "pueue_task": 366,
+   "result": "120,266-token prompt, 26.5 steps/s, 3.14 tokens per step, about 83 tok/s. Accepted 84.3/72.3/57.9 %, hit 98.6 %, 508 s total."
   }
  ]
 }

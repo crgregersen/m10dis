@@ -102,7 +102,22 @@ Byte check with drafts: 0 bad of 192,342,684 at 120k, all 3 rows of every decode
 
 Two fixes were needed. Graphs replay with inert rows, which write-through now skips. And with drafts in graph mode the indexer's 128 MiB workspace no longer fits between fragments (T358), so `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=48`.
 
-Not tested yet: the full 262,144 tokens, the chat template at this length, and repeated A/B pairs.
+Real use at the full context (`kv_own_chat_261k`, T362): a chat request of 260,951 tokens with a recall question. The model named the first and last file correctly, quoted the first line exactly, and stopped normally after 739 tokens. About 68 tok/s (26.0 steps/s × 2.6), hit 95.7 %, 20.7 minutes in total.
+
+Humaneval with `ignore_eos`:
+
+| Context | Drafts | Decode | Tokens per step | Accepted per position | Runs |
+|---|---|---|---|---|---|
+| 265 tokens | 2 | ≈ 88.5 tok/s (steady window), 69.8 overall | 2.67 | 89 / 78 % | T363 |
+| 265 tokens | 3 | 81.9 tok/s overall, no steady window | 3.25 | 84 / 75 / 66 % | T364 |
+| 120k | 2 | ≈ 84 tok/s | 2.69 | 90 / 79 % | T365 |
+| 120k | 3 | ≈ 83 tok/s | 3.14 | 84 / 72 / 58 % | T366 |
+
+These don't compare directly with T317 and T318 (88.3 and 96.3 tok/s overall). The text diverges at token 77 in both tier runs, and T317 and T318 fall into a repetitive `assert` loop with 94 unique tokens, against 270 here, which inflates their acceptance. Whether the fixed point of divergence is a near-tie or a small numeric effect of the unfused QSA path is not measured.
+
+Own mode adds about 3 s once per client start: warm-up compiles the stub shape, so the real attention kernel compiles at first use.
+
+Not tested yet: repeated A/B pairs, per-token latency at this length.
 
 ## Phases
 

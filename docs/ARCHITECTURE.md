@@ -21,7 +21,7 @@ Almost all the bytes are in the experts: about 121 GB of routed weights against 
 |---|---|---|
 | Token embedding | CPU RAM | read by the RTX zero-copy (`Q38_CPU_EMBEDDING=1`, `Q38_EMBEDDING_ZERO_COPY=1`) |
 | GDN and attention layers, QSA indexer, router, norms | RTX 3070 Ti | vLLM 0.32, CUDA graphs; GDN, QSA and hyper-connection weights in FP8 (block-scaled, `qwen38_fp8_block_quant.py`, `qwen38_hc_fp8.py`) |
-| KV cache and GDN state | RTX | 2.5 GiB, 94,631 tokens, prefix caching off |
+| KV cache and GDN state | RTX | 2.5 GiB, 94,631 tokens, prefix caching off. Optional K/V tier: QSA K/V in host RAM with a VRAM block cache, up to 262k tokens ([KV_TIER.md](KV_TIER.md)) |
 | Routed experts | 20 GM107 (cards 0–4 in worker order) | each GPU holds 32 of the 640 intermediate rows of every expert in every layer: 512 × 32 × 2560 × 3 B ≈ 126 MB per layer, ≈ 6 GB per GPU |
 | Shared expert | the 4 GM107 of the sixth card | worker 20 holds the card's reduced result and the shared gate |
 | N-gram embedding table | all 24 GM107 | 128 shards spread by PCI address; rows fetched per token with worker mode 6 (row gather) |
