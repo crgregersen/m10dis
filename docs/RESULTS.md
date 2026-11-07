@@ -166,6 +166,8 @@ With K/V fully out of vLLM's pool (`Q38_KV_TIER_OWN=1`, 0 drafts), the context i
 
 Byte comparison at 255k: 0 bad of 397,725,744 selected entries. K/V takes about 6 GB of host RAM at this length.
 
+With 2 drafts: ≈ 72 tok/s at 120k and ≈ 66 tok/s at 255k, one measurement each (one 10-second window × tokens per step, runs `kv_own_k2_120k` v2, `kv_own_k2_255k` v2). Byte comparison at 120k: 0 bad of 192,342,684.
+
 ## Accuracy
 
 Benchmarks ran on 2026-11-04 with the frozen benchmark configuration ([BENCHMARKS.md](BENCHMARKS.md)). Each was compared with the model card's published number, against a threshold registered before the run.

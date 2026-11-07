@@ -167,9 +167,11 @@ __global__ static void q38_kv_resolve_kernel(Q38KvTierArgs a) {
 // K/V of its real token: the pool at the real position, or host RAM below cache_tokens, where the pool now holds the cache.
 __global__ static void q38_kv_verify_kernel(Q38KvTierArgs a, uint32_t cache_tokens, unsigned long long *checked, unsigned long long *bad) {
     if (!a.st->enabled) return;
-    const int32_t count = a.in[a.width - 1];
+    for (uint32_t r = 0; r < a.rows; r++) {
+    const int32_t *in = a.in + uint64_t(r) * a.width, *out = a.out + uint64_t(r) * a.width;
+    const int32_t count = in[a.width - 1];
     for (int32_t j = int32_t(blockIdx.x * blockDim.x + threadIdx.x); j < count; j += int32_t(gridDim.x * blockDim.x)) {
-        const int32_t tok = a.in[j], v = a.out[j];
+        const int32_t tok = in[j], v = out[j];
         const uint4 *x = reinterpret_cast<const uint4 *>(q38_kv_addr(a, uint64_t(v)));
         const uint4 *y = reinterpret_cast<const uint4 *>(uint32_t(tok) < cache_tokens ? a.host + uint64_t(tok) * 2048u : q38_kv_addr(a, uint64_t(tok)));
         uint32_t diff = v < 0 ? 1u : 0u;
@@ -177,13 +179,17 @@ __global__ static void q38_kv_verify_kernel(Q38KvTierArgs a, uint32_t cache_toke
         atomicAdd(checked, 1ull);
         if (diff) atomicAdd(bad, 1ull);
     }
+    }
 }
 
 // Phase 2: all rows' new K/V from the inbox to host RAM, before any row of this call can select them.
-__global__ static void q38_kv_write_through_kernel(const uint4 *inbox, uint8_t *host, const int64_t *positions, uint32_t rows) {
+// A graph captured for more rows than the step has replays with inert rows (count 0, stale position): skip them.
+__global__ static void q38_kv_write_through_kernel(const uint4 *inbox, uint8_t *host, const int64_t *positions, uint32_t rows,
+        const int32_t *in, uint32_t width) {
     const uint32_t n = rows * Q38_KV_TOKEN_VEC;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const uint32_t r = i / Q38_KV_TOKEN_VEC, w = i % Q38_KV_TOKEN_VEC;
+        if (in[uint64_t(r) * width + width - 1] <= 0) continue;
         reinterpret_cast<uint4 *>(host + uint64_t(positions[r]) * 2048u)[w] = inbox[i];
     }
     __threadfence_system();

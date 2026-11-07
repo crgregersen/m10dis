@@ -2369,6 +2369,57 @@
    "pre_reg": "about 50-53 tok/s. No retry.",
    "pueue_task": 356,
    "result": "PASS. 255,047-token prompt, 1000 tokens, 51.4 tok/s decode window (graph), prefill about 237 tok/s, hit 97.9 % over prefill and decode, 0 overflow, all checks OK."
+  },
+  {
+   "label": "kv_own_k2_verify_20261107_v1",
+   "what": "120k code prompt, 2 drafts, eager, K/V out of the pool, cache 32k tokens, pool 1.15 GiB, byte check of all decode rows, 300 new tokens",
+   "goal": "K/V correct with 3 rows per step, inert rows skipped",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "0 bad, 0 overflow, coherent text. No retry.",
+   "pueue_task": 357,
+   "result": "0 bad of 192,342,684, all 3 rows per decode step, 0 overflow, hit 98.6 %, 300 tokens at 120k. Accepted 78.1/57.0 % per position, 2.34 tokens per step, text coherent."
+  },
+  {
+   "label": "kv_own_k2_120k_20261107_v1",
+   "what": "120k code prompt, 2 drafts, graph, K/V out of the pool, cache 32k, pool 1.15 GiB, 1000 new tokens",
+   "goal": "decode tok/s and acceptance at 120k with drafts, against 52.7 tok/s at 0 drafts (T353)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "failed",
+   "pre_reg": "60-85 tok/s depending on acceptance on this prompt. No retry.",
+   "pueue_task": 358,
+   "result": "RTX out of memory in prefill, 128 MiB indexer workspace: 6.00 GiB allocated, 1.07 GiB reserved but fragmented. Graph mode only. Cleanup: check FAIL only on client; ACS, DMA, registers, daemon OK."
+  },
+  {
+   "label": "kv_own_k2_255k_20261107_v1",
+   "what": "255k code prompt, 2 drafts, graph, ignore_eos, K/V out of the pool, cache 32k, pool 1.55 GiB, 1000 new tokens",
+   "goal": "decode tok/s with drafts at near full context; memory fit",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "not_run",
+   "pre_reg": "Tight memory, 2.4 GiB for pool and cache; may run out in graph capture. 55-80 tok/s if it fits. No retry.",
+   "result": "Dependency failed: T358."
+  },
+  {
+   "label": "kv_own_k2_120k_20261107_v2",
+   "what": "120k code prompt, 2 drafts, graph, K/V out of the pool, cache 32k, pool 1.15 GiB, 1000 new tokens, indexer workspace 48 MiB",
+   "goal": "decode tok/s and acceptance at 120k with drafts, against 52.7 tok/s at 0 drafts (T353)",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "60-85 tok/s depending on acceptance on this prompt. No retry.",
+   "retry_of": "kv_own_k2_120k_20261107_v1",
+   "pueue_task": 360,
+   "result": "PASS. 120,047-token prompt, 2 drafts, graph, 1000 tokens: 30.3 steps/s in the last full 10 s window, 2.38 tokens per step, about 72 tok/s; accepted 78.1/59.1 %; hit 98.6 %, 0 overflow; prefill about 240 tok/s; pool 1.15 GiB, cache 32k, indexer workspace 48 MiB."
+  },
+  {
+   "label": "kv_own_k2_255k_20261107_v2",
+   "what": "255k code prompt, 2 drafts, graph, ignore_eos, K/V out of the pool, cache 32k, pool 1.55 GiB, 1000 new tokens, indexer workspace 48 MiB",
+   "goal": "decode tok/s with drafts at near full context; memory fit",
+   "runner": "src/run_qwen38_decode_profile.sh",
+   "status": "success",
+   "pre_reg": "Tight memory, 2.4 GiB for pool and cache; may run out in graph capture. 55-80 tok/s if it fits. No retry.",
+   "retry_of": "kv_own_k2_255k_20261107_v1",
+   "pueue_task": 361,
+   "result": "PASS. 255,047-token prompt, 2 drafts, graph, ignore_eos, 1000 tokens: 29.2 steps/s in the last full 10 s window, 2.26 tokens per step, about 66 tok/s; accepted 73.8/52.3 %; hit 96.3 %, 0 overflow; prefill about 217 tok/s (19.6 minutes); pool 1.55 GiB, cache 32k, indexer workspace 48 MiB. Memory fit."
   }
  ]
 }

@@ -1,6 +1,6 @@
 # Plan: host-memory K/V tier for the full-attention layers
 
-**Status: Phases 0–3 done for 0 drafts, up to 255k tokens. Drafts with K/V out of the pool are not tested yet.** Goal: decode at up to 262k tokens on the 8 GB RTX, with K/V in host RAM and a VRAM cache of the blocks in use. Numbers marked *(estimate)* are calculations. Background: [KV_ATTENTION_ON_M10.md](KV_ATTENTION_ON_M10.md), runs `qsa_select_*` (T319–T322).
+**Status: Phases 0–3 done, 0 and 2 drafts, up to 255k tokens.** Goal: decode at up to 262k tokens on the 8 GB RTX, with K/V in host RAM and a VRAM cache of the blocks in use. Numbers marked *(estimate)* are calculations. Background: [KV_ATTENTION_ON_M10.md](KV_ATTENTION_ON_M10.md), runs `qsa_select_*` (T319–T322).
 
 ## The idea
 
@@ -91,7 +91,18 @@ Prefill beat the plan's estimate of about 200 tok/s, and the cache was enough: t
 
 At 255k the prompt's first generated token was `<|im_end|>` at logprob −0.01: a raw code dump reads as a finished user turn. This is the model's choice, not a fault (T354, T355). With `ignore_eos` the text is coherent, and it lists files from the start of the prompt.
 
-Not tested yet: drafts with K/V out of the pool, and the full 262,144 tokens. vLLM's own figure for 2 drafts at 262k is a 1.34 GiB pool (`analyze_kv_layout.py`).
+With 2 drafts (decode rates are one 10-second window × tokens per step):
+
+| Prompt | Cache per layer | Pool | Prefill | Decode | Accepted per position | Runs |
+|---|---|---|---|---|---|---|
+| 120k | 32k tokens | 1.15 GiB | ≈ 240 tok/s | ≈ 72 tok/s (30.3 steps/s × 2.38) | 78 / 59 % | T360 |
+| 255k | 32k tokens | 1.55 GiB | ≈ 217 tok/s, 20 minutes | ≈ 66 tok/s (29.2 steps/s × 2.26) | 74 / 52 % | T361 |
+
+Byte check with drafts: 0 bad of 192,342,684 at 120k, all 3 rows of every decode step (T357).
+
+Two fixes were needed. Graphs replay with inert rows, which write-through now skips. And with drafts in graph mode the indexer's 128 MiB workspace no longer fits between fragments (T358), so `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=48`.
+
+Not tested yet: the full 262,144 tokens, the chat template at this length, and repeated A/B pairs.
 
 ## Phases
 

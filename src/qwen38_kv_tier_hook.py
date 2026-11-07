@@ -27,9 +27,9 @@ def _lib():
     lib.q38_kv_tier_state_size.restype = ctypes.c_size_t
     lib.q38_kv_tier_register.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t]
     lib.q38_kv_tier_populate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-    lib.q38_kv_verify.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.q38_kv_verify.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
     lib.q38_kv_resolve.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-    lib.q38_kv_write_through.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.q38_kv_write_through.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
     return lib
 
 
@@ -196,7 +196,7 @@ def _install_own(tokens: int, max_tokens: int, verify: bool) -> dict:
         width = real.shape[1]
         err = ctypes.create_string_buffer(512)
         stream = torch.cuda.current_stream().cuda_stream
-        _check(lib.q38_kv_write_through(inbox.data_ptr(), s["host_dev"], positions.data_ptr(), rows, stream, err, len(err)), err)
+        _check(lib.q38_kv_write_through(inbox.data_ptr(), s["host_dev"], positions.data_ptr(), rows, real.data_ptr(), width, stream, err, len(err)), err)
         step = sub if rows > 4 else rows
         result = None
         try:
@@ -207,7 +207,7 @@ def _install_own(tokens: int, max_tokens: int, verify: bool) -> dict:
                                           s["b2s"].data_ptr(), s["s2b"].data_ptr(), s["epoch"].data_ptr(), s["st"].data_ptr(), inbox.data_ptr() + i * 2048, stream, err, len(err)), err)
                 if verify:
                     count = s.setdefault("verify", torch.zeros(2, dtype=torch.int64, device=real.device))
-                    _check(lib.q38_kv_verify(real.data_ptr() + i * width * 4, shadow.data_ptr() + i * width * 4, width, positions.data_ptr() + i * 8, s["raw"].data_ptr(),
+                    _check(lib.q38_kv_verify(real.data_ptr() + i * width * 4, shadow.data_ptr() + i * width * 4, width, j - i if rows <= 4 else 1, positions.data_ptr() + i * 8, s["raw"].data_ptr(),
                                              s["block_stride"], s["token_stride"], s["page_tokens"], s["table"].data_ptr(), s["host_dev"],
                                              s["st"].data_ptr(), 0xFFFFFFFF, count.data_ptr(), count[1:].data_ptr(), stream, err, len(err)), err)
                 buffers["topk_indices_buffer"] = shadow[i:j]
@@ -272,7 +272,7 @@ def install() -> dict | None:
                                   s["b2s"].data_ptr(), s["s2b"].data_ptr(), s["epoch"].data_ptr(), s["st"].data_ptr(), None, stream, err, len(err)), err)
         if verify:                                    # eager only: a K/V byte check of this row
             count = s.setdefault("verify", torch.zeros(2, dtype=torch.int64, device=real.device))
-            _check(lib.q38_kv_verify(real.data_ptr(), s["shadow"].data_ptr(), real.shape[1], side.logical_positions.data_ptr(), s["kv"],
+            _check(lib.q38_kv_verify(real.data_ptr(), s["shadow"].data_ptr(), real.shape[1], rows, side.logical_positions.data_ptr(), s["kv"],
                                      s["block_stride"], s["token_stride"], s["page_tokens"], attn_metadata.block_table.data_ptr(), s["host_dev"],
                                      s["st"].data_ptr(), tokens, count.data_ptr(), count[1:].data_ptr(), stream, err, len(err)), err)
         buffers["topk_indices_buffer"] = s["shadow"]

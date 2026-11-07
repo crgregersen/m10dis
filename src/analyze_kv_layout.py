@@ -21,7 +21,7 @@ def run(name, sp, max_len, kv_bytes):
         print(f"{name}: FAILED {type(e).__name__}: {str(e)[:200]}"); return
     gs = collections.Counter((g.kv_cache_spec.block_size, g.kv_cache_spec.page_size_bytes, len(g.layer_names)) for g in cfg.kv_cache_groups)
     print(f"{name} max_len {max_len}: blocks {cfg.num_blocks}, concurrency {U.get_max_concurrency_for_kv_cache_config(v, cfg):.2f}, groups (block_tokens, page_bytes, layers) x n: {dict(gs)}")
-def shrink(sp, head=8, kv=1, mtp=False):
+def shrink(sp, head=16, kv=1, mtp=False):
     out = {}
     for k, s in sp.items():
         if type(s) is FullAttentionSpec and (mtp or "mtp" not in k):
